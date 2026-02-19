@@ -6,6 +6,9 @@ import 'package:network_speed_test/services/fast_service.dart';
 import 'package:network_speed_test/services/ookla_service.dart';
 import 'package:network_speed_test/services/cloudflare_service.dart';
 import 'package:network_speed_test/utils/debug_logger.dart';
+import 'package:network_speed_test/services/isp_service.dart';
+import 'package:network_speed_test/models/network_info.dart';
+import 'package:network_speed_test/widgets/isp_banner.dart';
 
 void main() {
   runApp(const MyApp());
@@ -43,6 +46,7 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
   final FastService _fastService = FastService();
   final OoklaService _ooklaService = OoklaService();
   final CloudflareService _cloudflareService = CloudflareService();
+  final IspService _ispService = IspService();
   final DebugLogger _logger = DebugLogger();
 
   // --- Global State ---
@@ -52,6 +56,9 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
   double _globalUpload = 0.0;
   String _globalStatus = "Ready";
   bool _isGlobalBusy = false;
+
+  // Network Info
+  NetworkInfo? _networkInfo;
 
   // --- Persistent Results & Status per Test ---
   // Real Speed (iperf3)
@@ -378,12 +385,25 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
       ),
       body: Column(
         children: [
+          // 0. ISP Banner (Zero-Click Detection)
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: IspBanner(
+              ispService: _ispService,
+              showIp: true,
+              onDetected: (info) {
+                _networkInfo = info;
+                // Optional: trigger setState if you need to use info elsewhere
+              },
+            ),
+          ),
+
           // 1. Top Section: Global Meter (Compact)
-          Expanded(flex: 35, child: _buildGlobalMeter()),
+          Expanded(flex: 30, child: _buildGlobalMeter()),
 
           // 2. Bottom Section: Test List (Compact)
           Expanded(
-            flex: 65,
+            flex: 60,
             child: Container(
               width: double.infinity,
               decoration: const BoxDecoration(
@@ -508,6 +528,16 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
               fontFamily: 'monospace',
             ),
           ),
+
+          // Debugging Info (Network Info if available)
+          if (_networkInfo != null && _activeTestId != 0)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(
+                "Testing against ${_networkInfo!.ispName}",
+                style: const TextStyle(color: Colors.grey, fontSize: 10),
+              ),
+            ),
         ],
       ),
     );
@@ -643,6 +673,7 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
                       fontFamily: 'monospace',
                     ),
                     overflow: TextOverflow.ellipsis,
+                    maxLines: 1,
                   ),
                 ),
 
