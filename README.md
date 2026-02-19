@@ -52,7 +52,7 @@ _Optimized for Content Delivery_
 
 This project is built with Flutter. To run it locally:
 
-```bash
+
 # 1. Clone the repository
 git clone [https://github.com/Start-app-dev/network_speed_test.git](https://github.com/Start-app-dev/network_speed_test.git)
 
