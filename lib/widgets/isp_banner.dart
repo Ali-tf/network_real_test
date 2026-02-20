@@ -133,9 +133,9 @@ class _IspBannerState extends State<IspBanner>
       key: const ValueKey('loading'),
       padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
       decoration: BoxDecoration(
-        color: Colors.white.withOpacity(0.05),
+        color: Colors.white.withValues(alpha: 0.05),
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: Colors.white.withOpacity(0.08)),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
@@ -146,7 +146,7 @@ class _IspBannerState extends State<IspBanner>
             child: CircularProgressIndicator(
               strokeWidth: 2,
               valueColor: AlwaysStoppedAnimation<Color>(
-                Colors.cyanAccent.withOpacity(0.6),
+                Colors.cyanAccent.withValues(alpha: 0.6),
               ),
             ),
           ),
@@ -161,9 +161,9 @@ class _IspBannerState extends State<IspBanner>
                     begin: Alignment.centerLeft,
                     end: Alignment.centerRight,
                     colors: [
-                      Colors.white.withOpacity(0.3),
-                      Colors.white.withOpacity(0.7),
-                      Colors.white.withOpacity(0.3),
+                      Colors.white.withValues(alpha: 0.3),
+                      Colors.white.withValues(alpha: 0.7),
+                      Colors.white.withValues(alpha: 0.3),
                     ],
                     stops: [
                       _shimmerController.value - 0.3,
@@ -201,12 +201,12 @@ class _IspBannerState extends State<IspBanner>
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
         decoration: BoxDecoration(
-          color: Colors.white.withOpacity(0.06),
+          color: Colors.white.withValues(alpha: 0.06),
           borderRadius: BorderRadius.circular(16),
           border: Border.all(
             color: hasFullData
-                ? Colors.cyanAccent.withOpacity(0.15)
-                : Colors.orangeAccent.withOpacity(0.15),
+                ? Colors.cyanAccent.withValues(alpha: 0.15)
+                : Colors.orangeAccent.withValues(alpha: 0.15),
           ),
         ),
         child: Row(
@@ -226,7 +226,7 @@ class _IspBannerState extends State<IspBanner>
                   Text(
                     info.shortLabel,
                     style: TextStyle(
-                      color: Colors.white.withOpacity(0.95),
+                      color: Colors.white.withValues(alpha: 0.95),
                       fontSize: 15,
                       fontWeight: FontWeight.w600,
                       letterSpacing: 0.2,
@@ -245,7 +245,7 @@ class _IspBannerState extends State<IspBanner>
                         Text(
                           info.maskedIp,
                           style: TextStyle(
-                            color: Colors.white.withOpacity(0.45),
+                            color: Colors.white.withValues(alpha: 0.45),
                             fontSize: 12,
                             fontFamily: 'monospace',
                             letterSpacing: 0.5,
@@ -257,7 +257,7 @@ class _IspBannerState extends State<IspBanner>
                             child: Text(
                               '•',
                               style: TextStyle(
-                                color: Colors.white.withOpacity(0.25),
+                                color: Colors.white.withValues(alpha: 0.25),
                                 fontSize: 12,
                               ),
                             ),
@@ -271,7 +271,7 @@ class _IspBannerState extends State<IspBanner>
                                 ? '${info.city}, ${info.country}'
                                 : info.country,
                             style: TextStyle(
-                              color: Colors.white.withOpacity(0.45),
+                              color: Colors.white.withValues(alpha: 0.45),
                               fontSize: 12,
                             ),
                             overflow: TextOverflow.ellipsis,
@@ -300,8 +300,8 @@ class _IspBannerState extends State<IspBanner>
     return Icon(
       info.hasFullData ? Icons.cell_tower_rounded : Icons.language_rounded,
       color: info.hasFullData
-          ? Colors.cyanAccent.withOpacity(0.7)
-          : Colors.orangeAccent.withOpacity(0.7),
+          ? Colors.cyanAccent.withValues(alpha: 0.7)
+          : Colors.orangeAccent.withValues(alpha: 0.7),
       size: 24,
     );
   }
@@ -327,16 +327,16 @@ class _IspBannerState extends State<IspBanner>
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
         decoration: BoxDecoration(
-          color: Colors.red.withOpacity(0.06),
+          color: Colors.red.withValues(alpha: 0.06),
           borderRadius: BorderRadius.circular(16),
-          border: Border.all(color: Colors.redAccent.withOpacity(0.15)),
+          border: Border.all(color: Colors.redAccent.withValues(alpha: 0.15)),
         ),
         child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
             Icon(
               Icons.wifi_off_rounded,
-              color: Colors.redAccent.withOpacity(0.7),
+              color: Colors.redAccent.withValues(alpha: 0.7),
               size: 22,
             ),
             const SizedBox(width: 12),
@@ -347,7 +347,7 @@ class _IspBannerState extends State<IspBanner>
                 Text(
                   'No Connection',
                   style: TextStyle(
-                    color: Colors.white.withOpacity(0.8),
+                    color: Colors.white.withValues(alpha: 0.8),
                     fontSize: 14,
                     fontWeight: FontWeight.w600,
                   ),
@@ -356,7 +356,7 @@ class _IspBannerState extends State<IspBanner>
                 Text(
                   'Tap to retry',
                   style: TextStyle(
-                    color: Colors.white.withOpacity(0.35),
+                    color: Colors.white.withValues(alpha: 0.35),
                     fontSize: 12,
                   ),
                 ),

@@ -1,8 +1,10 @@
 import 'dart:async';
 import 'dart:io' as io;
 import 'dart:typed_data';
-import 'package:http/http.dart' as http;
+
 import 'package:network_speed_test/utils/debug_logger.dart';
+import 'package:network_speed_test/utils/smooth_speed_meter.dart';
+import 'package:network_speed_test/utils/test_lifecycle.dart';
 
 // ─── Data Model (unchanged — compatible with your UI) ─────
 class RealSpeedResult {
@@ -21,106 +23,41 @@ class RealSpeedResult {
   });
 }
 
-// ─── Internal: one data-point in the sliding window ───────
-class _Sample {
-  final int us; // elapsed µs from Stopwatch
-  final int bytes; // cumulative bytes at that instant
-  const _Sample(this.us, this.bytes);
-}
+// ─── Internal: One data-point in the sliding window ───────
+// Superseded by SmoothSpeedMeter. Left blank.
 
 // ─── Service ──────────────────────────────────────────────
 class RealSpeedHttpService {
-  bool _isCancelled = false;
-  http.Client? _dlClient;
-  io.HttpClient? _ulClient;
-
+  final TestLifecycle _lifecycle = TestLifecycle();
   final DebugLogger _logger = DebugLogger();
 
   // ── Endpoints ──
-  static const _downloadUrl = 'http://proof.ovh.net/files/1Gb.dat';
+  static const _downloadUrl =
+      'https://github.com/desktop/desktop/releases/download/release-3.3.13/GitHubDesktopSetup-x64.exe';
   static const _uploadUrl = 'https://speed.cloudflare.com/__up';
 
   // ── Tunables ──
   static const _testDurationSec = 15; // max seconds per phase
   static const _uiTickMs = 250; // gauge refresh (4 Hz)
-  static const _windowUs = 1000000; // 1-s sliding window (µs)
-  static const _pruneUs = 2000000; // discard samples > 2 s old
   static const _ulChunkBytes = 512 * 1024; // 512 KB upload chunk
+  static const _dlWorkerCount = 16;
+  static const _ulWorkerCount = 16;
   static const _connectTimeout = Duration(seconds: 10);
 
   // ═══════════ PUBLIC API ══════════════════════════════════
 
   void cancel() {
-    _isCancelled = true;
-    _teardown();
+    _lifecycle.cancel();
     _logger.log('[RealSpeed] Cancelled by user.');
   }
 
   /// Emits live [RealSpeedResult] updates.  The stream closes
   /// automatically when both phases finish (or on error).
   Stream<RealSpeedResult> measureSpeed() {
-    _isCancelled = false;
+    _lifecycle.reset();
     final ctrl = StreamController<RealSpeedResult>();
     _run(ctrl);
     return ctrl.stream;
-  }
-
-  // ═══════════ HELPERS ═════════════════════════════════════
-
-  /// Forcefully tear down every active connection.
-  void _teardown() {
-    _dlClient?.close();
-    _dlClient = null;
-    _ulClient?.close(force: true); // force: kills open sockets NOW
-    _ulClient = null;
-  }
-
-  /// Convert cumulative [bytes] over [us] microseconds to Megabits/s.
-  ///
-  /// Derivation:
-  ///   seconds = µs ÷ 10⁶
-  ///   Mbps    = (bytes × 8) ÷ (10⁶ × seconds)
-  ///           = (bytes × 8) ÷ µs
-  ///
-  /// Check: 1 000 000 B in 1 000 000 µs → 8.0 Mbps ✓
-  static double _mbps(int bytes, int us) {
-    if (us <= 0 || bytes <= 0) return 0.0;
-    return (bytes * 8.0) / us;
-  }
-
-  /// Average speed over the most recent [_windowUs] microseconds.
-  ///
-  /// Walks the buffer backwards to find the latest sample that
-  /// is ≥ 1 s before [nowUs], then computes ΔBytes / ΔTime.
-  /// This is far more stable than an EMA because one slow or
-  /// fast chunk cannot spike the result.
-  double _windowedSpeed(List<_Sample> buf, int nowUs) {
-    if (buf.length < 2) return 0.0;
-
-    final cutoff = nowUs - _windowUs;
-
-    // Anchor = latest sample AT or BEFORE cutoff.
-    // Guarantees window ≥ 1 s once enough history exists.
-    _Sample anchor = buf.first;
-    for (int i = buf.length - 1; i >= 0; i--) {
-      if (buf[i].us <= cutoff) {
-        anchor = buf[i];
-        break;
-      }
-    }
-
-    final tip = buf.last;
-    final dBytes = tip.bytes - anchor.bytes;
-    final dUs = tip.us - anchor.us;
-    return _mbps(dBytes, dUs);
-  }
-
-  /// Drop samples older than 2 × window to bound memory.
-  void _pruneBuf(List<_Sample> buf, int nowUs) {
-    final limit = nowUs - _pruneUs;
-    while (buf.length > 2 && buf.first.us < limit) {
-      buf.removeAt(0);
-    }
   }
 
   // ═══════════ ORCHESTRATOR ════════════════════════════════
@@ -132,14 +69,14 @@ class RealSpeedHttpService {
     try {
       // ── Phase 1 ──
       dlMbps = await _download(ctrl);
-      if (_isCancelled) return;
+      if (_lifecycle.isUserCancelled) return;
 
       // Brief pause so the gauge visually resets
       await Future.delayed(const Duration(milliseconds: 500));
 
       // ── Phase 2 ──
       ulMbps = await _upload(ctrl, dlMbps);
-      if (_isCancelled) return;
+      if (_lifecycle.isUserCancelled) return;
 
       // ── Done ──
       if (!ctrl.isClosed) {
@@ -165,7 +102,6 @@ class RealSpeedHttpService {
         );
       }
     } finally {
-      _teardown();
       if (!ctrl.isClosed) await ctrl.close();
     }
   }
@@ -178,81 +114,81 @@ class RealSpeedHttpService {
   Future<double> _download(StreamController<RealSpeedResult> ctrl) async {
     ctrl.add(RealSpeedResult(downloadSpeedMbps: 0, status: 'Downloading…'));
 
-    final client = http.Client();
-    _dlClient = client;
+    final httpClient = io.HttpClient()..maxConnectionsPerHost = 64;
+    _lifecycle.registerClient(httpClient);
 
-    final req = http.Request('GET', Uri.parse(_downloadUrl));
-    final resp = await client.send(req).timeout(_connectTimeout);
-
-    if (resp.statusCode != 200) {
-      throw Exception('DL failed: HTTP ${resp.statusCode}');
-    }
-
-    // ── Timing starts AFTER the connection + headers ──
-    int totalBytes = 0;
-    final sw = Stopwatch()..start();
-    final buf = <_Sample>[const _Sample(0, 0)];
-    final done = Completer<void>();
-    StreamSubscription<List<int>>? sub;
+    final meter = SmoothSpeedMeter(totalDurationSeconds: _testDurationSec);
+    meter.start();
+    _lifecycle.beginPhase();
 
     // ❶ KILL TIMER — tears down the TCP socket at exactly 15 s.
     final kill = Timer(Duration(seconds: _testDurationSec), () {
-      _logger.log('[DL] Kill timer → closing socket.');
-      sub?.cancel();
-      client.close(); // socket dies here
-      if (!done.isCompleted) done.complete();
+      _lifecycle.timeoutPhase();
     });
+    _lifecycle.registerTimer(kill);
 
     // ❷ UI TICKER — records a sample and emits a smoothed speed.
     final ui = Timer.periodic(Duration(milliseconds: _uiTickMs), (_) {
-      if (ctrl.isClosed || done.isCompleted) return;
-      final now = sw.elapsedMicroseconds;
-      buf.add(_Sample(now, totalBytes));
-      _pruneBuf(buf, now);
+      if (ctrl.isClosed || _lifecycle.shouldStop) return;
       ctrl.add(
         RealSpeedResult(
-          downloadSpeedMbps: _windowedSpeed(buf, now),
+          downloadSpeedMbps: meter.tick(),
           status: 'Downloading…',
         ),
       );
     });
+    _lifecycle.registerTimer(ui);
 
-    // ❸ STREAM LISTENER — just accumulates bytes.
-    sub = resp.stream.listen(
-      (chunk) {
-        if (_isCancelled || done.isCompleted) {
-          sub?.cancel();
-          if (!done.isCompleted) done.complete();
-          return;
+    // ❸ WORKER LOOP - Spawn 16 parallel requests running continuously
+    for (int w = 0; w < _dlWorkerCount; w++) {
+      _lifecycle.launchWorker(() async {
+        while (!_lifecycle.shouldStop) {
+          try {
+            final request = await httpClient
+                .getUrl(Uri.parse(_downloadUrl))
+                .timeout(_connectTimeout);
+            final response = await request.close();
+
+            if (response.statusCode != 200 &&
+                response.statusCode != 302 &&
+                response.statusCode != 206) {
+              await Future.delayed(const Duration(milliseconds: 500));
+              continue; // Retry
+            }
+
+            final completer = Completer<void>();
+            // Continuously read the stream
+            response.listen(
+              (chunk) {
+                if (_lifecycle.shouldStop) {
+                  if (!completer.isCompleted) completer.complete();
+                  return;
+                }
+                meter.addBytes(chunk.length);
+              },
+              onError: (e) {
+                if (!completer.isCompleted) completer.complete();
+              },
+              onDone: () {
+                if (!completer.isCompleted) completer.complete();
+              },
+              cancelOnError: true,
+            );
+            await completer.future;
+          } catch (e) {
+            if (!_lifecycle.shouldStop) {
+              await Future.delayed(const Duration(milliseconds: 500));
+            }
+          }
         }
-        totalBytes += chunk.length;
-      },
-      onError: (e) {
-        if (!done.isCompleted) done.completeError(e);
-      },
-      onDone: () {
-        if (!done.isCompleted) done.complete();
-      },
-      cancelOnError: true,
-    );
-
-    try {
-      await done.future;
-    } catch (_) {
-      /* force-close may fire error */
+      });
     }
 
-    sw.stop();
-    kill.cancel();
-    ui.cancel();
-    _dlClient = null;
+    await _lifecycle.awaitPhaseComplete();
+    await _lifecycle.awaitAllWorkers();
 
-    final mbps = _mbps(totalBytes, sw.elapsedMicroseconds);
-    _logger.log(
-      '[DL] ${_fmtBytes(totalBytes)} in '
-      '${(sw.elapsedMicroseconds / 1e6).toStringAsFixed(1)} s '
-      '→ ${mbps.toStringAsFixed(2)} Mbps',
-    );
+    final mbps = meter.finish();
+    _logger.log('[DL] Finished at ${mbps.toStringAsFixed(2)} Mbps');
     return mbps;
   }
 
@@ -274,103 +210,78 @@ class RealSpeedHttpService {
       ),
     );
 
-    final httpClient = io.HttpClient();
-    _ulClient = httpClient;
-
     // ── Build a non-compressible 512 KB chunk ──
     // LCG-style fill so ISP transparent compression can't cheat.
-    // Allocated ONCE, reused every iteration → zero GC pressure.
     final chunk = Uint8List(_ulChunkBytes);
     for (int i = 0; i < chunk.length; i++) {
       chunk[i] = (i * 131 + 17) & 0xFF;
     }
 
-    // Open connection (DNS + TCP + TLS handshake happens here).
-    final request = await httpClient
-        .postUrl(Uri.parse(_uploadUrl))
-        .timeout(_connectTimeout);
-    request.headers.contentType = io.ContentType.binary;
-    request.headers.chunkedTransferEncoding = true;
-
-    // ── Timing starts AFTER the handshake ──
-    int totalBytes = 0;
-    final sw = Stopwatch()..start();
-    final buf = <_Sample>[const _Sample(0, 0)];
-    bool killed = false;
+    final meter = SmoothSpeedMeter(totalDurationSeconds: _testDurationSec);
+    meter.start();
+    _lifecycle.beginPhase();
 
     // ❶ KILL TIMER — violently closes ALL sockets on the client.
     final kill = Timer(Duration(seconds: _testDurationSec), () {
-      killed = true;
       _logger.log('[UL] Kill timer → force-closing HttpClient.');
-      httpClient.close(force: true); // every socket dies instantly
+      _lifecycle.timeoutPhase();
     });
+    _lifecycle.registerTimer(kill);
 
     // ❷ UI TICKER — emits smoothed speed.
     final ui = Timer.periodic(Duration(milliseconds: _uiTickMs), (_) {
-      if (ctrl.isClosed || killed) return;
-      final now = sw.elapsedMicroseconds;
-      buf.add(_Sample(now, totalBytes));
-      _pruneBuf(buf, now);
+      if (ctrl.isClosed || _lifecycle.shouldStop) return;
       ctrl.add(
         RealSpeedResult(
           downloadSpeedMbps: dlMbps,
-          uploadSpeedMbps: _windowedSpeed(buf, now),
+          uploadSpeedMbps: meter.tick(),
           status: 'Uploading…',
         ),
       );
     });
+    _lifecycle.registerTimer(ui);
 
-    // ❸ WRITE LOOP — the core fix.
-    //
-    //   request.add(chunk)   → queues data in dart's IOSink buffer
-    //   request.flush()      → returns a Future that completes ONLY
-    //                          when the OS TCP send buffer has accepted
-    //                          the data.  When the buffer is full (i.e.
-    //                          the network is the bottleneck), flush()
-    //                          BLOCKS.  This is real backpressure.
-    //
-    //   totalBytes is incremented AFTER flush() succeeds, so we only
-    //   count bytes the OS has actually accepted for transmission.
-    try {
-      while (!killed && !_isCancelled) {
-        request.add(chunk);
-        await request.flush(); // ← BLOCKS at network speed
-        totalBytes += chunk.length; // ← counted AFTER confirmation
+    // Create a fresh HttpClient for the upload phase and register it with the lifecycle.
+    final httpClient = io.HttpClient();
+    _lifecycle.registerClient(httpClient);
 
-        final now = sw.elapsedMicroseconds;
-        buf.add(_Sample(now, totalBytes));
-        _pruneBuf(buf, now);
-      }
-    } catch (e) {
-      // SocketException / HttpException is EXPECTED when the kill
-      // timer fires and destroys the socket mid-flush.
-      if (!killed && !_isCancelled) {
-        _logger.log('[UL] Unexpected write error: $e');
-      }
+    // ❸ WORKER LOOP - Spawn parallel POST requests
+    for (int w = 0; w < _ulWorkerCount; w++) {
+      _lifecycle.launchWorker(() async {
+        io.HttpClientRequest? request;
+        try {
+          // Open connection (DNS + TCP + TLS handshake happens here).
+          request = await httpClient
+              .postUrl(Uri.parse(_uploadUrl))
+              .timeout(_connectTimeout);
+          request.headers.contentType = io.ContentType.binary;
+          request.headers.chunkedTransferEncoding = true;
+
+          while (!_lifecycle.shouldStop) {
+            request.add(chunk);
+            await request.flush(); // ← BLOCKS at network speed
+            meter.addBytes(chunk.length); // ← counted AFTER confirmation
+          }
+        } catch (e) {
+          if (!_lifecycle.shouldStop) {
+            _logger.log('[UL] W$w write error: $e');
+          }
+        } finally {
+          try {
+            if (request != null) {
+              final res = await request.close();
+              await res.drain();
+            }
+          } catch (_) {}
+        }
+      });
     }
 
-    sw.stop();
-    kill.cancel();
-    ui.cancel();
-    try {
-      await request.close();
-    } catch (_) {} // best-effort graceful close
-    _ulClient = null;
+    await _lifecycle.awaitPhaseComplete();
+    await _lifecycle.awaitAllWorkers();
 
-    final mbps = _mbps(totalBytes, sw.elapsedMicroseconds);
-    _logger.log(
-      '[UL] ${_fmtBytes(totalBytes)} in '
-      '${(sw.elapsedMicroseconds / 1e6).toStringAsFixed(1)} s '
-      '→ ${mbps.toStringAsFixed(2)} Mbps',
-    );
+    final mbps = meter.finish();
+    _logger.log('[UL] Finished at ${mbps.toStringAsFixed(2)} Mbps');
     return mbps;
-  }
-
-  // ── Formatting helper for logs ──
-  static String _fmtBytes(int b) {
-    if (b >= 1e9) return '${(b / 1e9).toStringAsFixed(2)} GB';
-    if (b >= 1e6) return '${(b / 1e6).toStringAsFixed(1)} MB';
-    if (b >= 1e3) return '${(b / 1e3).toStringAsFixed(0)} KB';
-    return '$b B';
   }
 }

@@ -1,12 +1,14 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' as io;
 import 'dart:math' as math;
 import 'dart:typed_data';
 
-import 'package:http/http.dart' as http;
 import 'package:speed_test_dart/speed_test_dart.dart';
 import 'package:speed_test_dart/classes/classes.dart';
 import 'package:network_speed_test/utils/debug_logger.dart';
+import 'package:network_speed_test/utils/smooth_speed_meter.dart';
+import 'package:network_speed_test/utils/test_lifecycle.dart';
 
 // ═══════════════════════════════════════════════════════════════
 // Result Model
@@ -41,13 +43,12 @@ class OoklaResult {
 // ═══════════════════════════════════════════════════════════════
 
 class _Config {
-  static const int maxWorkers = 8;
+  static const int maxWorkers = 16;
   static const int initialWorkers = 2;
   static const int rampUpStep = 2;
   static const int rampUpIntervalMs = 2000;
   static const int phaseTimeoutSeconds = 15;
   static const int uiUpdateIntervalMs = 150;
-  static const double emaSmoothingFactor = 0.3;
   static const int pingSampleCount = 10;
 
   static const List<String> downloadFiles = [
@@ -69,115 +70,29 @@ class _Config {
 // Byte Counter (Thread-Safe for Single Isolate)
 // ═══════════════════════════════════════════════════════════════
 
-class _ByteCounter {
-  int _totalBytes = 0;
-  int _lastSnapshotBytes = 0;
-  DateTime _lastSnapshotTime = DateTime.now();
-
-  int get totalBytes => _totalBytes;
-
-  void add(int bytes) {
-    _totalBytes += bytes;
-  }
-
-  void reset() {
-    _totalBytes = 0;
-    _lastSnapshotBytes = 0;
-    _lastSnapshotTime = DateTime.now();
-  }
-
-  /// Returns interval Mbps since the last snapshot call.
-  double snapshotMbps() {
-    final now = DateTime.now();
-    final elapsedUs = now.difference(_lastSnapshotTime).inMicroseconds;
-    final deltaBytes = _totalBytes - _lastSnapshotBytes;
-
-    _lastSnapshotBytes = _totalBytes;
-    _lastSnapshotTime = now;
-
-    if (elapsedUs <= 0) return 0.0;
-    // Mbps = (bytes * 8) / (seconds * 1_000_000)
-    //      = (bytes * 8) / (microseconds / 1_000_000 * 1_000_000)
-    //      = (bytes * 8) / microseconds * 1_000_000 / 1_000_000
-    //      = (bytes * 8_000_000) / (microseconds * 1_000_000)
-    return (deltaBytes * 8.0) / elapsedUs; // Mbps
-  }
-
-  /// Cumulative average Mbps from a given start time.
-  double cumulativeMbps(DateTime startTime) {
-    final elapsedUs = DateTime.now().difference(startTime).inMicroseconds;
-    if (elapsedUs <= 0) return 0.0;
-    return (_totalBytes * 8.0) / elapsedUs; // Mbps
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════
-// EMA Smoother
-// ═══════════════════════════════════════════════════════════════
-
-class _EmaSmoother {
-  final double alpha;
-  double? _value;
-
-  _EmaSmoother({required this.alpha});
-
-  double smooth(double newValue) {
-    if (_value == null) {
-      _value = newValue;
-      return newValue;
-    }
-    _value = alpha * newValue + (1 - alpha) * _value!;
-    return _value!;
-  }
-
-  void reset() => _value = null;
-}
+// Removed legacy _ByteCounter and _EmaSmoother
 
 // ═══════════════════════════════════════════════════════════════
 // Ookla Service
 // ═══════════════════════════════════════════════════════════════
 
 class OoklaService {
-  bool _isCancelled = false;
+  final TestLifecycle _lifecycle = TestLifecycle();
   final SpeedTestDart _tester = SpeedTestDart();
   final DebugLogger _logger = DebugLogger();
-
-  final List<http.Client> _activeClients = [];
-  final List<StreamSubscription> _activeSubscriptions = [];
 
   // ── Public API ──────────────────────────────────────────────
 
   void cancel() {
-    _isCancelled = true;
+    _lifecycle.cancel();
     _logger.log("[Ookla] Cancel requested.");
-    _cleanupAll();
   }
 
   Stream<OoklaResult> measureSpeed() {
     final controller = StreamController<OoklaResult>();
-    _isCancelled = false;
-    _activeClients.clear();
-    _activeSubscriptions.clear();
+    _lifecycle.reset();
     _runPipeline(controller);
     return controller.stream;
-  }
-
-  // ── Cleanup ─────────────────────────────────────────────────
-
-  void _cleanupAll() {
-    for (final sub in _activeSubscriptions) {
-      try {
-        sub.cancel();
-      } catch (_) {}
-    }
-    _activeSubscriptions.clear();
-
-    for (final client in _activeClients) {
-      try {
-        client.close();
-      } catch (_) {}
-    }
-    _activeClients.clear();
   }
 
   // ── Pipeline ────────────────────────────────────────────────
@@ -279,7 +194,6 @@ class OoklaService {
         OoklaResult(downloadSpeedMbps: 0, error: e.toString(), status: "Error"),
       );
     } finally {
-      _cleanupAll();
       if (!controller.isClosed) controller.close();
     }
   }
@@ -289,43 +203,55 @@ class OoklaService {
   // ═══════════════════════════════════════════════════════════
 
   Future<List<Server>> _fetchServers() async {
-    final response = await http
-        .get(
-          Uri.parse(
-            'https://www.speedtest.net/api/js/servers?engine=js&limit=40',
-          ),
-          headers: {
-            'User-Agent':
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'application/json, */*; q=0.01',
-            'Referer': 'https://www.speedtest.net/',
-          },
-        )
-        .timeout(const Duration(seconds: 10));
+    final client = io.HttpClient();
+    _lifecycle.registerClient(client);
 
-    if (response.statusCode != 200) {
-      throw Exception('Server list HTTP ${response.statusCode}');
-    }
-
-    final List<dynamic> jsonList = json.decode(response.body);
-    return jsonList.map((d) {
-      final lat = double.tryParse(d['lat'].toString()) ?? 0.0;
-      final lon = double.tryParse(d['lon'].toString()) ?? 0.0;
-      return Server(
-        int.tryParse(d['id'].toString()) ?? 0,
-        d['name']?.toString() ?? '',
-        d['country']?.toString() ?? '',
-        d['sponsor']?.toString() ?? '',
-        d['host']?.toString() ?? '',
-        d['url']?.toString() ?? '',
-        lat,
-        lon,
-        99999999999,
-        99999999999,
-        Coordinate(lat, lon),
+    try {
+      final request = await client.getUrl(
+        Uri.parse(
+          'https://www.speedtest.net/api/js/servers?engine=js&limit=40',
+        ),
       );
-    }).toList();
+      request.headers.set(
+        'User-Agent',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+      );
+      request.headers.set('Accept', 'application/json, */*; q=0.01');
+      request.headers.set('Referer', 'https://www.speedtest.net/');
+
+      final response = await request.close().timeout(
+        const Duration(seconds: 10),
+      );
+
+      if (response.statusCode != 200) {
+        throw Exception('Server list HTTP ${response.statusCode}');
+      }
+
+      final body = await response.transform(utf8.decoder).join();
+      final List<dynamic> jsonList = json.decode(body);
+      return jsonList.map((d) {
+        final lat = double.tryParse(d['lat'].toString()) ?? 0.0;
+        final lon = double.tryParse(d['lon'].toString()) ?? 0.0;
+        return Server(
+          int.tryParse(d['id'].toString()) ?? 0,
+          d['name']?.toString() ?? '',
+          d['country']?.toString() ?? '',
+          d['sponsor']?.toString() ?? '',
+          d['host']?.toString() ?? '',
+          d['url']?.toString() ?? '',
+          lat,
+          lon,
+          99999999999,
+          99999999999,
+          Coordinate(lat, lon),
+        );
+      }).toList();
+    } finally {
+      try {
+        client.close(force: true);
+      } catch (_) {}
+    }
   }
 
   Future<List<Server>> _selectCandidates(
@@ -360,25 +286,30 @@ class OoklaService {
   Future<Map<String, double>> _measurePingJitter(Server server) async {
     final url = _pingUrl(server);
     final samples = <double>[];
-    final client = http.Client();
-    _activeClients.add(client);
+    final client = io.HttpClient();
+    _lifecycle.registerClient(client);
 
     try {
       for (int i = 0; i < _Config.pingSampleCount; i++) {
-        if (_isCancelled) break;
+        if (_lifecycle.shouldStop) break;
         try {
           final sw = Stopwatch()..start();
-          await client
-              .get(Uri.parse('$url?x=${DateTime.now().microsecondsSinceEpoch}'))
-              .timeout(const Duration(seconds: 3));
+          final request = await client.getUrl(
+            Uri.parse('$url?x=${DateTime.now().microsecondsSinceEpoch}'),
+          );
+          final response = await request.close().timeout(
+            const Duration(seconds: 3),
+          );
+          await response.drain();
           sw.stop();
           samples.add(sw.elapsedMicroseconds / 1000.0);
         } catch (_) {}
         await Future.delayed(const Duration(milliseconds: 100));
       }
     } finally {
-      client.close();
-      _activeClients.remove(client);
+      try {
+        client.close(force: true);
+      } catch (_) {}
     }
 
     if (samples.isEmpty) return {'ping': 0.0, 'jitter': 0.0};
@@ -414,45 +345,38 @@ class OoklaService {
     double pingMs,
     double jitterMs,
   ) async {
-    final counter = _ByteCounter();
-    final smoother = _EmaSmoother(alpha: _Config.emaSmoothingFactor);
+    final meter = SmoothSpeedMeter(
+      totalDurationSeconds: _Config.phaseTimeoutSeconds,
+    );
+    meter.start();
+
     final start = DateTime.now();
     final deadline = start.add(
       const Duration(seconds: _Config.phaseTimeoutSeconds),
     );
 
-    double peakSmoothed = 0;
     int activeWorkerCount = 0;
     int fileIndex = 0;
     final baseUrl = _downloadBaseUrl(server);
 
-    // Take initial snapshot baseline
-    counter.snapshotMbps();
-
     final completer = Completer<double>();
+    _lifecycle.beginPhase();
 
     // ── Monitor Timer ──
     final monitor = Timer.periodic(
       const Duration(milliseconds: _Config.uiUpdateIntervalMs),
       (timer) {
-        if (_isCancelled ||
+        if (_lifecycle.shouldStop ||
             DateTime.now().isAfter(deadline) ||
             controller.isClosed) {
-          timer.cancel();
-          if (!completer.isCompleted) {
-            completer.complete(_finalSpeed(counter, start, peakSmoothed));
-          }
+          _lifecycle.timeoutPhase();
           return;
         }
-
-        final instant = counter.snapshotMbps();
-        final smoothed = smoother.smooth(instant);
-        if (smoothed > peakSmoothed) peakSmoothed = smoothed;
 
         _emit(
           controller,
           OoklaResult(
-            downloadSpeedMbps: math.max(0, smoothed),
+            downloadSpeedMbps: math.max(0, meter.tick()),
             pingMs: pingMs,
             jitterMs: jitterMs,
             status: "Testing Download...",
@@ -462,6 +386,7 @@ class OoklaService {
         );
       },
     );
+    _lifecycle.registerTimer(monitor);
 
     // ── Ramp-Up Timer ──
     // Launches initial workers, then adds more over time
@@ -469,7 +394,7 @@ class OoklaService {
       _Config.initialWorkers,
       baseUrl,
       _Config.downloadFiles[fileIndex],
-      counter,
+      meter,
       deadline,
     );
     activeWorkerCount = _Config.initialWorkers;
@@ -477,7 +402,7 @@ class OoklaService {
     final rampUp = Timer.periodic(
       const Duration(milliseconds: _Config.rampUpIntervalMs),
       (timer) {
-        if (_isCancelled ||
+        if (_lifecycle.shouldStop ||
             DateTime.now().isAfter(deadline) ||
             activeWorkerCount >= _Config.maxWorkers) {
           timer.cancel();
@@ -498,17 +423,19 @@ class OoklaService {
           toAdd,
           baseUrl,
           _Config.downloadFiles[fileIndex],
-          counter,
+          meter,
           deadline,
         );
         activeWorkerCount += toAdd;
       },
     );
+    _lifecycle.registerTimer(rampUp);
 
+    await _lifecycle.awaitPhaseComplete();
+    await _lifecycle.awaitAllWorkers();
+
+    if (!completer.isCompleted) completer.complete(meter.finish());
     final result = await completer.future;
-    monitor.cancel();
-    rampUp.cancel();
-    _cleanupAll();
     return result;
   }
 
@@ -516,13 +443,16 @@ class OoklaService {
     int count,
     String baseUrl,
     String file,
-    _ByteCounter counter,
+    SmoothSpeedMeter meter,
     DateTime deadline,
   ) {
     for (int i = 0; i < count; i++) {
-      final client = http.Client();
-      _activeClients.add(client);
-      _downloadWorker(client, '$baseUrl$file', counter, deadline);
+      _lifecycle.launchWorker(
+        () => Future.delayed(
+          Duration(milliseconds: i * 50),
+          () => _downloadWorker('$baseUrl$file', meter, deadline),
+        ),
+      );
     }
   }
 
@@ -530,51 +460,34 @@ class OoklaService {
   /// network via `response.stream.listen`. This is inherently
   /// accurate — no buffering inflation possible.
   Future<void> _downloadWorker(
-    http.Client client,
     String url,
-    _ByteCounter counter,
+    SmoothSpeedMeter meter,
     DateTime deadline,
   ) async {
-    while (!_isCancelled && DateTime.now().isBefore(deadline)) {
+    final client = io.HttpClient();
+    _lifecycle.registerClient(client);
+
+    while (!_lifecycle.shouldStop && DateTime.now().isBefore(deadline)) {
       try {
         final bustUrl = '$url?x=${DateTime.now().microsecondsSinceEpoch}';
-        final request = http.Request('GET', Uri.parse(bustUrl));
-        request.headers['Cache-Control'] = 'no-cache';
-        request.headers['Connection'] = 'keep-alive';
+        final request = await client.getUrl(Uri.parse(bustUrl));
+        request.headers.set('Cache-Control', 'no-cache');
+        request.headers.set('Connection', 'keep-alive');
 
-        final response = await client
-            .send(request)
-            .timeout(const Duration(seconds: 10));
+        final response = await request.close().timeout(
+          const Duration(seconds: 10),
+        );
 
         if (response.statusCode == 200) {
-          final c = Completer<void>();
-          StreamSubscription<List<int>>? sub;
-
-          sub = response.stream.listen(
-            (chunk) {
-              if (_isCancelled || DateTime.now().isAfter(deadline)) {
-                sub?.cancel();
-                if (!c.isCompleted) c.complete();
-                return;
-              }
-              // ✅ CORRECT: These bytes just arrived from the network
-              counter.add(chunk.length);
-            },
-            onError: (_) {
-              if (!c.isCompleted) c.complete();
-            },
-            onDone: () {
-              if (!c.isCompleted) c.complete();
-            },
-            cancelOnError: true,
-          );
-
-          _activeSubscriptions.add(sub);
-          await c.future;
-          _activeSubscriptions.remove(sub);
+          await response.forEach((chunk) {
+            if (_lifecycle.shouldStop || DateTime.now().isAfter(deadline)) {
+              throw Exception('Worker aborted');
+            }
+            meter.addBytes(chunk.length);
+          });
         }
       } catch (_) {
-        if (_isCancelled) return;
+        if (_lifecycle.shouldStop) return;
         await Future.delayed(const Duration(milliseconds: 200));
       }
     }
@@ -610,46 +523,40 @@ class OoklaService {
     double pingMs,
     double jitterMs,
   ) async {
-    final counter = _ByteCounter();
-    final smoother = _EmaSmoother(alpha: _Config.emaSmoothingFactor);
+    final meter = SmoothSpeedMeter(
+      totalDurationSeconds: _Config.phaseTimeoutSeconds,
+    );
+    meter.start();
+
     final start = DateTime.now();
     final deadline = start.add(
       const Duration(seconds: _Config.phaseTimeoutSeconds),
     );
 
-    double peakSmoothed = 0;
     int activeWorkerCount = 0;
 
     // Pre-allocate a single upload payload — shared read-only by all workers
     final payload = _generateUploadPayload(_Config.uploadPayloadSize);
 
-    counter.snapshotMbps();
-
     final completer = Completer<double>();
+    _lifecycle.beginPhase();
 
     // ── Monitor Timer ──
     final monitor = Timer.periodic(
       const Duration(milliseconds: _Config.uiUpdateIntervalMs),
       (timer) {
-        if (_isCancelled ||
+        if (_lifecycle.shouldStop ||
             DateTime.now().isAfter(deadline) ||
             controller.isClosed) {
-          timer.cancel();
-          if (!completer.isCompleted) {
-            completer.complete(_finalSpeed(counter, start, peakSmoothed));
-          }
+          _lifecycle.timeoutPhase();
           return;
         }
-
-        final instant = counter.snapshotMbps();
-        final smoothed = smoother.smooth(instant);
-        if (smoothed > peakSmoothed) peakSmoothed = smoothed;
 
         _emit(
           controller,
           OoklaResult(
             downloadSpeedMbps: downloadMbps,
-            uploadSpeedMbps: math.max(0, smoothed),
+            uploadSpeedMbps: math.max(0, meter.tick()),
             pingMs: pingMs,
             jitterMs: jitterMs,
             status: "Testing Upload...",
@@ -659,13 +566,14 @@ class OoklaService {
         );
       },
     );
+    _lifecycle.registerTimer(monitor);
 
     // ── Launch initial workers ──
     _spawnUploadWorkers(
       _Config.initialWorkers,
       server,
       payload,
-      counter,
+      meter,
       deadline,
     );
     activeWorkerCount = _Config.initialWorkers;
@@ -674,7 +582,7 @@ class OoklaService {
     final rampUp = Timer.periodic(
       const Duration(milliseconds: _Config.rampUpIntervalMs),
       (timer) {
-        if (_isCancelled ||
+        if (_lifecycle.shouldStop ||
             DateTime.now().isAfter(deadline) ||
             activeWorkerCount >= _Config.maxWorkers) {
           timer.cancel();
@@ -690,15 +598,17 @@ class OoklaService {
           "[Ookla] UL ramp: +$toAdd workers → "
           "${activeWorkerCount + toAdd}",
         );
-        _spawnUploadWorkers(toAdd, server, payload, counter, deadline);
+        _spawnUploadWorkers(toAdd, server, payload, meter, deadline);
         activeWorkerCount += toAdd;
       },
     );
+    _lifecycle.registerTimer(rampUp);
 
+    await _lifecycle.awaitPhaseComplete();
+    await _lifecycle.awaitAllWorkers();
+
+    if (!completer.isCompleted) completer.complete(meter.finish());
     final result = await completer.future;
-    monitor.cancel();
-    rampUp.cancel();
-    _cleanupAll();
     return result;
   }
 
@@ -706,13 +616,16 @@ class OoklaService {
     int count,
     Server server,
     Uint8List payload,
-    _ByteCounter counter,
+    SmoothSpeedMeter meter,
     DateTime deadline,
   ) {
     for (int i = 0; i < count; i++) {
-      final client = http.Client();
-      _activeClients.add(client);
-      _uploadWorker(client, server, payload, counter, deadline);
+      _lifecycle.launchWorker(
+        () => Future.delayed(
+          Duration(milliseconds: i * 50),
+          () => _uploadWorker(server, payload, meter, deadline),
+        ),
+      );
     }
   }
 
@@ -720,7 +633,7 @@ class OoklaService {
   /// Bytes are counted ONLY AFTER the server responds.
   ///
   /// Why this is correct:
-  ///   client.post() blocks until:
+  ///   client.postUrl() blocks until:
   ///     1. The payload is fully transmitted over TCP
   ///     2. The server processes it
   ///     3. The HTTP response is received
@@ -736,35 +649,46 @@ class OoklaService {
   ///   At 200 Mbps, it's ~800 confirmations/sec.
   ///   At 10 Mbps, it's ~40/sec — still 6 per gauge update.
   Future<void> _uploadWorker(
-    http.Client client,
     Server server,
     Uint8List payload,
-    _ByteCounter counter,
+    SmoothSpeedMeter meter,
     DateTime deadline,
   ) async {
-    while (!_isCancelled && DateTime.now().isBefore(deadline)) {
+    final client = io.HttpClient();
+    _lifecycle.registerClient(client);
+
+    while (!_lifecycle.shouldStop && DateTime.now().isBefore(deadline)) {
       try {
-        // ── Synchronous POST: blocks until server confirms ──
-        final response = await client
-            .post(
-              Uri.parse(server.url),
-              headers: {
-                'Connection': 'keep-alive',
-                'Content-Type': 'application/octet-stream',
-              },
-              body: payload,
-            )
-            .timeout(const Duration(seconds: 10));
+        // Add Cache-Buster to prevent server ignoring request
+        final bustUrl =
+            '${server.url}?x=${DateTime.now().microsecondsSinceEpoch}';
+        final request = await client.postUrl(Uri.parse(bustUrl));
+
+        request.headers.set('Connection', 'keep-alive');
+        request.headers.set('Content-Type', 'application/octet-stream');
+
+        // Critical: Tell Ookla server the payload size
+        request.contentLength = payload.length;
+        request.add(payload);
+
+        final response = await request.close().timeout(
+          const Duration(seconds: 10),
+        );
 
         if (response.statusCode == 200) {
-          // ✅ THE FIX: Count bytes ONLY here, after the server
-          // has confirmed receipt. This elapsed time reflects
-          // actual network transmission time.
-          counter.add(payload.length);
+          await response.drain();
+          if (!_lifecycle.shouldStop) {
+            meter.addBytes(payload.length);
+          }
+        } else {
+          _logger.log(
+            "[Ookla UL] Server rejected with status: ${response.statusCode}",
+          );
+          await response.drain();
         }
       } catch (e) {
-        if (_isCancelled) return;
-        // Don't count failed uploads — they didn't transfer data
+        if (_lifecycle.shouldStop) return;
+        _logger.log('[Ookla UL Error] $e');
         await Future.delayed(const Duration(milliseconds: 200));
       }
     }
@@ -792,7 +716,7 @@ class OoklaService {
     final uri = Uri.parse(server.url);
     final segs = List<String>.from(uri.pathSegments);
     if (segs.isNotEmpty) segs.removeLast();
-    return uri.replace(pathSegments: segs).toString() + '/';
+    return '${uri.replace(pathSegments: segs)}/';
   }
 
   String _pingUrl(Server server) {
@@ -812,21 +736,14 @@ class OoklaService {
   }
 
   bool _abort(StreamController<OoklaResult> controller) {
-    if (_isCancelled || controller.isClosed) {
-      _cleanupAll();
+    if (_lifecycle.isUserCancelled || controller.isClosed) {
       if (!controller.isClosed) controller.close();
       return true;
     }
     return false;
   }
 
-  /// Compute final reported speed.
-  /// Uses the higher of cumulative average and 95% of peak EMA.
-  /// This matches Ookla's behavior of reporting near-peak sustained.
-  double _finalSpeed(_ByteCounter counter, DateTime start, double peak) {
-    final cumulative = counter.cumulativeMbps(start);
-    return math.max(cumulative, peak * 0.95);
-  }
+  // Removed _finalSpeed
 
   double _haversine(double lat1, double lon1, double lat2, double lon2) {
     const p = 0.017453292519943295;

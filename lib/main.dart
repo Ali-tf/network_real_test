@@ -10,6 +10,7 @@ import 'package:network_speed_test/utils/debug_logger.dart';
 import 'package:network_speed_test/services/isp_service.dart';
 import 'package:network_speed_test/models/network_info.dart';
 import 'package:network_speed_test/widgets/isp_banner.dart';
+import 'package:network_speed_test/services/akamai_service.dart';
 
 void main() {
   runApp(const MyApp());
@@ -48,6 +49,7 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
   final OoklaService _ooklaService = OoklaService();
   final CloudflareService _cloudflareService = CloudflareService();
   final FacebookCdnService _facebookService = FacebookCdnService();
+  final AkamaiService _akamaiService = AkamaiService();
   final IspService _ispService = IspService();
   final DebugLogger _logger = DebugLogger();
 
@@ -82,6 +84,10 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
   FacebookCdnResult? _savedFacebookResult;
   String? _facebookStatus;
 
+  // Akamai Edge CDN
+  AkamaiResult? _savedAkamaiResult;
+  String? _akamaiStatus;
+
   // Real Speed Result
   // No retry logic needed for HTTP simple test
 
@@ -98,6 +104,7 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
     _ooklaService.cancel();
     _cloudflareService.cancel();
     _facebookService.cancel();
+    _akamaiService.cancel();
     _logger.removeListener(_onLog);
     super.dispose();
   }
@@ -408,6 +415,56 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
     }
   }
 
+  Future<void> _runAkamaiTest() async {
+    if (_isGlobalBusy) return;
+    setState(() {
+      _isGlobalBusy = true;
+      _activeTestId = 6;
+      _globalDownload = 0.0;
+      _globalUpload = 0.0;
+      _globalStatus = "Starting...";
+      _akamaiStatus = "Connecting";
+      _savedAkamaiResult = null;
+    });
+
+    try {
+      final stream = _akamaiService.measureSpeed();
+      await for (final res in stream) {
+        if (!mounted) break;
+        if (_activeTestId != 6) return; // Cancelled
+
+        setState(() {
+          // Status propagation
+          _akamaiStatus = res.status;
+          _globalStatus = res.status;
+
+          if (res.downloadMbps > 0) {
+            _globalDownload = res.downloadMbps;
+          }
+          if (res.uploadMbps > 0) {
+            _globalUpload = res.uploadMbps;
+          }
+          if (res.error != null) {
+            _globalStatus = "Failed";
+            _akamaiStatus = "Error: ${res.error}";
+          } else if (res.isDone) {
+            _globalStatus = "Complete";
+            _akamaiStatus = "Finished";
+            _savedAkamaiResult = res;
+          }
+        });
+      }
+    } finally {
+      if (mounted && _activeTestId == 6) {
+        setState(() {
+          _isGlobalBusy = false;
+          _activeTestId = 0;
+          _globalStatus = "Ready";
+        });
+      }
+    }
+  }
+
   // Retry logic removed
 
   // --- UI Builders ---
@@ -558,6 +615,36 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
                     finalUl: _savedFacebookResult?.uploadMbps, // Now supported
                     onStart: _runFacebookTest,
                   ),
+
+                  // Akamai CDN
+                  _buildTestTile(
+                    id: 6,
+                    title: "Akamai Edge-Cache",
+                    subtitle: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        _buildSticker(
+                          Icons.games,
+                          "Steam",
+                          Colors.indigoAccent,
+                        ),
+                        const SizedBox(width: 6),
+                        _buildSticker(Icons.apple, "Apple", Colors.grey),
+                        const SizedBox(width: 6),
+                        _buildSticker(
+                          Icons.picture_as_pdf,
+                          "Adobe",
+                          Colors.redAccent,
+                        ),
+                      ],
+                    ),
+                    icon: Icons.cloud_download,
+                    color: Colors.red,
+                    status: _akamaiStatus,
+                    finalDl: _savedAkamaiResult?.downloadMbps,
+                    finalUl: _savedAkamaiResult?.uploadMbps,
+                    onStart: _runAkamaiTest,
+                  ),
                 ],
               ),
             ),
@@ -633,6 +720,15 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
               "Edge: ${_savedFacebookResult!.cdnEdge}",
               style: const TextStyle(color: Colors.blueGrey, fontSize: 10),
             ),
+
+          // Akamai Specific Info
+          if (_activeTestId == 6 &&
+              _savedAkamaiResult != null &&
+              _savedAkamaiResult!.edgeIp != null)
+            Text(
+              "Node IP: ${_savedAkamaiResult!.edgeIp} • ${_savedAkamaiResult!.edgeNode}",
+              style: const TextStyle(color: Colors.redAccent, fontSize: 10),
+            ),
         ],
       ),
     );
@@ -654,7 +750,7 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
           "Mbps",
           style: TextStyle(
             fontSize: 12, // Reduced from 14
-            color: color.withOpacity(0.6),
+            color: color.withValues(alpha: 0.6),
             fontWeight: FontWeight.bold,
           ),
         ),
@@ -664,7 +760,7 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
           style: TextStyle(
             fontSize: 10,
             letterSpacing: 1.5,
-            color: color.withOpacity(0.4),
+            color: color.withValues(alpha: 0.4),
           ),
         ),
       ],
@@ -704,7 +800,7 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
               Container(
                 padding: const EdgeInsets.all(8), // Reduced from 10
                 decoration: BoxDecoration(
-                  color: color.withOpacity(0.1),
+                  color: color.withValues(alpha: 0.1),
                   shape: BoxShape.circle,
                 ),
                 child: Icon(icon, color: color, size: 20), // Reduced from 24
@@ -750,7 +846,9 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
                   icon: const Icon(Icons.play_arrow_rounded, size: 28),
                   padding: EdgeInsets.zero,
                   constraints: const BoxConstraints(),
-                  color: canStart ? Colors.white : Colors.grey.withOpacity(0.3),
+                  color: canStart
+                      ? Colors.white
+                      : Colors.grey.withValues(alpha: 0.3),
                   onPressed: canStart ? onStart : null,
                 ),
             ],
@@ -826,6 +924,8 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
         return Colors.purple;
       case 5:
         return Colors.blueAccent;
+      case 6:
+        return Colors.red;
       default:
         return Colors.grey;
     }
@@ -835,9 +935,9 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
       decoration: BoxDecoration(
-        color: color.withOpacity(0.15),
+        color: color.withValues(alpha: 0.15),
         borderRadius: BorderRadius.circular(4),
-        border: Border.all(color: color.withOpacity(0.3)),
+        border: Border.all(color: color.withValues(alpha: 0.3)),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
@@ -869,6 +969,8 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
         return "Cloudflare Speedtest";
       case 5:
         return "Facebook CDN";
+      case 6:
+        return "Akamai Edge-Cache";
       default:
         return "";
     }

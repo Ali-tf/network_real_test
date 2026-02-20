@@ -1,14 +1,16 @@
 import 'dart:async';
+import 'dart:io' as io;
 import 'dart:typed_data';
-import 'package:http/http.dart' as http;
 import 'package:network_speed_test/utils/debug_logger.dart';
+import 'package:network_speed_test/utils/smooth_speed_meter.dart';
+import 'package:network_speed_test/utils/test_lifecycle.dart';
 
 class CloudflareResult {
   final double downloadSpeedMbps;
   final double uploadSpeedMbps;
   final bool isDone;
   final String? error;
-  final String status; // New status field
+  final String status;
 
   CloudflareResult({
     required this.downloadSpeedMbps,
@@ -20,7 +22,7 @@ class CloudflareResult {
 }
 
 class CloudflareService {
-  bool _isCancelled = false;
+  final TestLifecycle _lifecycle = TestLifecycle();
   final DebugLogger _logger = DebugLogger();
 
   // Cloudflare Endpoints
@@ -29,13 +31,13 @@ class CloudflareService {
   static const String _uploadUrl = "https://speed.cloudflare.com/__up";
 
   void cancel() {
-    _isCancelled = true;
+    _lifecycle.cancel();
     _logger.log("[Cloudflare] Cancelled.");
   }
 
   Stream<CloudflareResult> measureSpeed() {
     final controller = StreamController<CloudflareResult>();
-    _isCancelled = false;
+    _lifecycle.reset();
 
     _startTest(controller);
 
@@ -43,7 +45,6 @@ class CloudflareService {
   }
 
   Future<void> _startTest(StreamController<CloudflareResult> controller) async {
-    final client = http.Client();
     try {
       _logger.log("[Cloudflare] Starting test...");
       controller.add(
@@ -56,38 +57,34 @@ class CloudflareService {
         CloudflareResult(downloadSpeedMbps: 0, status: "Preparing download..."),
       );
 
-      int totalBytesRead = 0;
-      final downloadStartTime = DateTime.now();
+      _lifecycle.beginPhase();
+      final dlMeter = SmoothSpeedMeter(totalDurationSeconds: 15);
+      dlMeter.start();
 
-      // Start 4 parallel workers for download
-      for (int i = 0; i < 4; i++) {
-        _downloadWorker(client, (bytes) {
-          totalBytesRead += bytes;
-        });
+      // Start 16 parallel workers for download
+      for (int i = 0; i < 16; i++) {
+        _lifecycle.launchWorker(
+          () => _downloadWorker((bytes) {
+            dlMeter.addBytes(bytes);
+          }),
+        );
       }
 
-      await _monitorPhase(
+      final finalDownloadMbps = await _monitorPhase(
         controller,
-        downloadStartTime,
-        () => totalBytesRead,
+        dlMeter,
         (mbps) => CloudflareResult(
           downloadSpeedMbps: mbps,
           status: "Testing Download...",
         ),
       );
 
-      if (_isCancelled) {
-        client.close();
+      await _lifecycle.awaitAllWorkers();
+
+      if (_lifecycle.isUserCancelled) {
         controller.close();
         return;
       }
-
-      // Calculate final download speed
-      final downloadElapsed = DateTime.now()
-          .difference(downloadStartTime)
-          .inMilliseconds;
-      final double finalDownloadMbps =
-          (totalBytesRead * 8 * 1000) / (downloadElapsed * 1000000);
 
       _logger.log(
         "[Cloudflare] Download result: ${finalDownloadMbps.toStringAsFixed(2)} Mbps",
@@ -103,20 +100,22 @@ class CloudflareService {
         ),
       );
 
-      int totalBytesSent = 0;
-      final uploadStartTime = DateTime.now();
+      _lifecycle.beginPhase();
+      final ulMeter = SmoothSpeedMeter(totalDurationSeconds: 15);
+      ulMeter.start();
 
-      // Start 4 parallel workers for upload
-      for (int i = 0; i < 4; i++) {
-        _uploadWorker(client, (bytes) {
-          totalBytesSent += bytes;
-        });
+      // Start 16 parallel workers for upload requires chunked data for interruptibility
+      for (int i = 0; i < 16; i++) {
+        _lifecycle.launchWorker(
+          () => _uploadWorker((bytes) {
+            ulMeter.addBytes(bytes);
+          }),
+        );
       }
 
-      await _monitorPhase(
+      final finalUploadMbps = await _monitorPhase(
         controller,
-        uploadStartTime,
-        () => totalBytesSent,
+        ulMeter,
         (mbps) => CloudflareResult(
           downloadSpeedMbps: finalDownloadMbps,
           uploadSpeedMbps: mbps,
@@ -125,18 +124,12 @@ class CloudflareService {
         ),
       );
 
-      client.close();
+      await _lifecycle.awaitAllWorkers();
 
-      if (_isCancelled) {
+      if (_lifecycle.isUserCancelled) {
         controller.close();
         return;
       }
-
-      final uploadElapsed = DateTime.now()
-          .difference(uploadStartTime)
-          .inMilliseconds;
-      final double finalUploadMbps =
-          (totalBytesSent * 8 * 1000) / (uploadElapsed * 1000000);
 
       _logger.log(
         "[Cloudflare] Upload result: ${finalUploadMbps.toStringAsFixed(2)} Mbps",
@@ -168,62 +161,48 @@ class CloudflareService {
         );
         controller.close();
       }
-      client.close();
     }
   }
 
-  Future<void> _monitorPhase(
+  Future<double> _monitorPhase(
     StreamController<CloudflareResult> controller,
-    DateTime startTime,
-    int Function() getBytes,
+    SmoothSpeedMeter meter,
     CloudflareResult Function(double mbps) createResult,
   ) async {
-    final completer = Completer<void>();
-
-    Timer.periodic(const Duration(milliseconds: 200), (timer) {
-      if (controller.isClosed || _isCancelled) {
-        timer.cancel();
-        if (!completer.isCompleted) completer.complete();
-        return;
-      }
-
-      final elapsed = DateTime.now().difference(startTime).inMilliseconds;
-
-      if (elapsed > 15000) {
-        // 15s Timeout
-        timer.cancel();
-        if (!completer.isCompleted) completer.complete();
-        return;
-      }
-
-      if (elapsed > 0) {
-        final double mbps = (getBytes() * 8 * 1000) / (elapsed * 1000000);
-        controller.add(createResult(mbps));
-      }
+    final killTimer = Timer(const Duration(seconds: 15), () {
+      _logger.log('[Cloudflare] Phase timeout (15s).');
+      _lifecycle.timeoutPhase();
     });
+    _lifecycle.registerTimer(killTimer);
 
-    await completer.future;
+    final uiTimer = Timer.periodic(const Duration(milliseconds: 200), (timer) {
+      if (controller.isClosed || _lifecycle.shouldStop) {
+        timer.cancel();
+        return;
+      }
+      controller.add(createResult(meter.tick()));
+    });
+    _lifecycle.registerTimer(uiTimer);
+
+    await _lifecycle.awaitPhaseComplete();
+
+    return meter.finish();
   }
 
-  Future<void> _downloadWorker(
-    http.Client client,
-    Function(int) onBytes,
-  ) async {
-    final phaseEndTime = DateTime.now().add(const Duration(seconds: 15));
+  Future<void> _downloadWorker(Function(int) onBytes) async {
+    final client = io.HttpClient();
+    _lifecycle.registerClient(client);
 
-    while (!_isCancelled && DateTime.now().isBefore(phaseEndTime)) {
-      try {
-        final request = http.Request('GET', Uri.parse(_downloadUrl));
-        final response = await client.send(request);
+    try {
+      while (!_lifecycle.shouldStop) {
+        final request = await client.getUrl(Uri.parse(_downloadUrl));
+        final response = await request.close();
 
         if (response.statusCode == 200) {
           final completer = Completer<void>();
-          StreamSubscription? subscription;
-
-          subscription = response.stream.listen(
+          response.listen(
             (chunk) {
-              if (_isCancelled || DateTime.now().isAfter(phaseEndTime)) {
-                subscription?.cancel();
+              if (_lifecycle.shouldStop) {
                 if (!completer.isCompleted) completer.complete();
                 return;
               }
@@ -235,36 +214,59 @@ class CloudflareService {
             onDone: () {
               if (!completer.isCompleted) completer.complete();
             },
+            cancelOnError: true,
           );
           await completer.future;
         } else {
           await Future.delayed(const Duration(milliseconds: 100));
         }
-      } catch (e) {
-        await Future.delayed(const Duration(milliseconds: 100));
       }
+    } catch (_) {
+      // Ignore network errors or socket closures gracefully
     }
   }
 
-  Future<void> _uploadWorker(http.Client client, Function(int) onBytes) async {
-    final phaseEndTime = DateTime.now().add(const Duration(seconds: 15));
-    final payload = Uint8List(1024 * 1024); // 1MB dummy data
+  Future<void> _uploadWorker(Function(int) onBytes) async {
+    final client = io.HttpClient();
+    _lifecycle.registerClient(client);
 
-    while (!_isCancelled && DateTime.now().isBefore(phaseEndTime)) {
-      try {
-        final response = await client.post(
-          Uri.parse(_uploadUrl),
-          body: payload,
-        );
+    // Chunk size: 512 KB
+    final chunk = Uint8List(512 * 1024);
+    for (int i = 0; i < chunk.length; i++) {
+      chunk[i] = (i * 131 + 17) & 0xFF; // Incompressible dummy data
+    }
 
-        if (response.statusCode == 200) {
-          onBytes(payload.length);
-        } else {
-          await Future.delayed(const Duration(milliseconds: 100));
+    try {
+      while (!_lifecycle.shouldStop) {
+        final request = await client.postUrl(Uri.parse(_uploadUrl));
+
+        // Disable automatic header chunking to avoid protocol confusion
+        // if the server doesn't like generic chunked POST uploads,
+        // but we don't know the exact length upfront if we just loop write.
+        // Actually, many CDNs reject un-lengthed POSTs. So we declare 1MB,
+        // and send 1MB.
+        request.contentLength = chunk.length * 2; // Declare 1 MB
+
+        try {
+          request.add(chunk); // 512 KB
+          await request.flush();
+          if (_lifecycle.shouldStop) break;
+          onBytes(chunk.length);
+
+          request.add(chunk); // 512 KB
+          await request.flush();
+          if (_lifecycle.shouldStop) break;
+          onBytes(chunk.length);
+
+          final response = await request.close();
+          // Consume the response body to recycle the connection
+          await response.drain();
+        } catch (_) {
+          break;
         }
-      } catch (e) {
-        await Future.delayed(const Duration(milliseconds: 100));
       }
+    } catch (_) {
+      // Ignore network errors
     }
   }
 }

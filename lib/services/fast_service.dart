@@ -5,6 +5,8 @@ import 'dart:math';
 import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 import 'package:network_speed_test/utils/debug_logger.dart';
+import 'package:network_speed_test/utils/smooth_speed_meter.dart';
+import 'package:network_speed_test/utils/test_lifecycle.dart';
 
 // ─── Data Model (unchanged — compatible with your UI) ──────────
 class FastResult {
@@ -23,13 +25,6 @@ class FastResult {
   });
 }
 
-// ─── Internal: one data-point in the sliding window ────────────
-class _Sample {
-  final int us; // elapsed µs from Stopwatch
-  final int bytes; // cumulative bytes at that instant
-  const _Sample(this.us, this.bytes);
-}
-
 // ─── Service ───────────────────────────────────────────────────
 class FastService {
   // Fast.com public JS-client token
@@ -38,77 +33,27 @@ class FastService {
   // ── Tunables ──
   static const int _testDurationSec = 15;
   static const int _uiTickMs = 250; // 4 Hz gauge refresh
-  static const int _windowUs = 1000000; // 1-s sliding window (µs)
-  static const int _pruneUs = 2000000; // discard samples > 2 s old
   static const int _maxStreams = 5; // parallel connections
   static const int _ulChunkBytes = 512 * 1024; // 512 KB upload chunk
   static const Duration _connectTimeout = Duration(seconds: 10);
 
-  bool _isCancelled = false;
-  io.HttpClient? _activeClient;
+  final TestLifecycle _lifecycle = TestLifecycle();
   final DebugLogger _logger = DebugLogger();
 
   // ═══════════ PUBLIC API ══════════════════════════════════════
 
   void cancel() {
-    _isCancelled = true;
-    _activeClient?.close(force: true);
-    _activeClient = null;
+    _lifecycle.cancel();
     _logger.log('[Fast] Cancelled by user.');
   }
 
   /// Emits live [FastResult] updates. Stream closes automatically
   /// when both phases finish, or on fatal error.
   Stream<FastResult> measureSpeed() {
-    _isCancelled = false;
+    _lifecycle.reset();
     final ctrl = StreamController<FastResult>();
     _run(ctrl);
     return ctrl.stream;
-  }
-
-  // ═══════════ MATH & HELPERS ══════════════════════════════════
-
-  /// Convert cumulative [bytes] over [us] microseconds to Mbps.
-  ///
-  ///   Mbps = (bytes × 8) / µs
-  ///
-  ///   Check: 1 000 000 B in 1 000 000 µs → 8.0 Mbps ✓
-  static double _mbps(int bytes, int us) {
-    if (us <= 0 || bytes <= 0) return 0.0;
-    return (bytes * 8.0) / us;
-  }
-
-  /// Average speed over the most recent [_windowUs] microseconds.
-  ///
-  /// Finds the latest sample that is ≥ 1 s before [nowUs], then
-  /// computes ΔBytes / ΔTime.  Far more stable than EMA because
-  /// one fast/slow chunk cannot spike the result.
-  double _windowedSpeed(List<_Sample> buf, int nowUs) {
-    if (buf.length < 2) return 0.0;
-    final cutoff = nowUs - _windowUs;
-
-    // Walk backwards to find anchor ≥ 1 s before now
-    _Sample anchor = buf.first;
-    for (int i = buf.length - 1; i >= 0; i--) {
-      if (buf[i].us <= cutoff) {
-        anchor = buf[i];
-        break;
-      }
-    }
-
-    final tip = buf.last;
-    final dBytes = tip.bytes - anchor.bytes;
-    final dUs = tip.us - anchor.us;
-    return _mbps(dBytes, dUs);
-  }
-
-  /// Drop samples older than 2 × window to bound memory.
-  /// At 4 Hz ticker, buffer never exceeds ~10 entries.
-  void _pruneBuf(List<_Sample> buf, int nowUs) {
-    final limit = nowUs - _pruneUs;
-    while (buf.length > 2 && buf.first.us < limit) {
-      buf.removeAt(0);
-    }
   }
 
   // ═══════════ FAST.COM API ════════════════════════════════════
@@ -148,6 +93,8 @@ class FastService {
   /// Returns recommended stream count (reduced for high-latency links).
   Future<int> _probeLatency(String url) async {
     final probe = io.HttpClient();
+    _lifecycle.registerClient(probe);
+
     try {
       final sw = Stopwatch()..start();
       final req = await probe
@@ -168,8 +115,6 @@ class FastService {
     } catch (e) {
       _logger.log('[Fast] Latency probe failed: $e');
       return _maxStreams; // default on failure
-    } finally {
-      probe.close();
     }
   }
 
@@ -187,23 +132,23 @@ class FastService {
       final urls = await _fetchTargets();
       if (urls.isEmpty) throw Exception('No Fast.com targets found');
       _logger.log('[Fast] ${urls.length} OCA targets acquired.');
-      if (_isCancelled) return;
+      if (_lifecycle.isUserCancelled) return;
 
       // ── Step 2: Latency-based stream count ──
       ctrl.add(FastResult(downloadSpeedMbps: 0, status: 'Checking latency…'));
       final streams = await _probeLatency(urls.first);
-      if (_isCancelled) return;
+      if (_lifecycle.isUserCancelled) return;
 
       // ── Step 3: Download ──
       dlMbps = await _downloadPhase(ctrl, urls, streams);
-      if (_isCancelled) return;
+      if (_lifecycle.isUserCancelled) return;
 
       // Brief pause so gauge visually resets between phases
       await Future.delayed(const Duration(milliseconds: 500));
 
       // ── Step 4: Upload ──
       ulMbps = await _uploadPhase(ctrl, urls, streams, dlMbps);
-      if (_isCancelled) return;
+      if (_lifecycle.isUserCancelled) return;
 
       // ── Done ──
       if (!ctrl.isClosed) {
@@ -234,8 +179,6 @@ class FastService {
         );
       }
     } finally {
-      _activeClient?.close(force: true);
-      _activeClient = null;
       if (!ctrl.isClosed) await ctrl.close();
     }
   }
@@ -256,60 +199,45 @@ class FastService {
   ) async {
     ctrl.add(FastResult(downloadSpeedMbps: 0, status: 'Starting download…'));
 
-    final client = io.HttpClient();
-    client.connectionTimeout = _connectTimeout;
-    _activeClient = client;
+    final meter = SmoothSpeedMeter(totalDurationSeconds: _testDurationSec);
+    meter.start();
+    _lifecycle.beginPhase();
 
-    int totalBytes = 0;
-    final sw = Stopwatch()..start();
-    final buf = <_Sample>[const _Sample(0, 0)];
-    bool killed = false;
-
-    // ❶ KILL TIMER — destroys every socket at exactly 15 s.
+    // ❶ KILL TIMER
     final kill = Timer(Duration(seconds: _testDurationSec), () {
-      killed = true;
       _logger.log('[Fast DL] Kill timer → force-closing all sockets.');
-      client.close(force: true);
+      _lifecycle.timeoutPhase();
     });
+    _lifecycle.registerTimer(kill);
 
-    // ❷ UI TICKER — records a sample and emits smoothed speed.
+    // ❷ UI TICKER
     final ui = Timer.periodic(Duration(milliseconds: _uiTickMs), (_) {
-      if (ctrl.isClosed || killed) return;
-      final now = sw.elapsedMicroseconds;
-      buf.add(_Sample(now, totalBytes));
-      _pruneBuf(buf, now);
+      if (ctrl.isClosed || _lifecycle.shouldStop) return;
       ctrl.add(
-        FastResult(
-          downloadSpeedMbps: _windowedSpeed(buf, now),
-          status: 'Downloading…',
-        ),
+        FastResult(downloadSpeedMbps: meter.tick(), status: 'Downloading…'),
       );
     });
+    _lifecycle.registerTimer(ui);
 
-    // ❸ WORKERS — all awaited via Future.wait.
+    final client = io.HttpClient();
+    client.connectionTimeout = _connectTimeout;
+    _lifecycle.registerClient(client);
+
+    // ❸ WORKERS — all launched and awaited via lifecycle
     final n = min(streams, urls.length);
-    final futures = <Future<void>>[];
     for (int i = 0; i < n; i++) {
-      futures.add(
-        _dlWorker(client, urls[i], (bytes) {
-          totalBytes += bytes;
-        }, () => killed || _isCancelled),
+      _lifecycle.launchWorker(
+        () => _dlWorker(client, urls[i], (bytes) {
+          meter.addBytes(bytes);
+        }),
       );
     }
 
-    await Future.wait(futures); // resolves once kill timer fires
+    await _lifecycle.awaitPhaseComplete();
+    await _lifecycle.awaitAllWorkers();
 
-    sw.stop();
-    kill.cancel();
-    ui.cancel();
-    if (_activeClient == client) _activeClient = null;
-
-    final mbps = _mbps(totalBytes, sw.elapsedMicroseconds);
-    _logger.log(
-      '[Fast DL] ${_fmtBytes(totalBytes)} in '
-      '${(sw.elapsedMicroseconds / 1e6).toStringAsFixed(1)}s '
-      '→ ${mbps.toStringAsFixed(2)} Mbps',
-    );
+    final mbps = meter.finish();
+    _logger.log('[Fast DL] finished at ${mbps.toStringAsFixed(2)} Mbps');
     return mbps;
   }
 
@@ -320,10 +248,9 @@ class FastService {
     io.HttpClient client,
     String url,
     void Function(int) onBytes,
-    bool Function() shouldStop,
   ) async {
     final uri = Uri.parse(url);
-    while (!shouldStop()) {
+    while (!_lifecycle.shouldStop) {
       try {
         final request = await client.getUrl(uri);
         final response = await request.close();
@@ -331,12 +258,12 @@ class FastService {
         // await-for provides natural backpressure: chunks arrive
         // at network speed, not memory speed.
         await for (final chunk in response) {
-          if (shouldStop()) break;
+          if (_lifecycle.shouldStop) break;
           onBytes(chunk.length);
         }
       } catch (e) {
         // SocketException is EXPECTED when kill timer fires.
-        if (!shouldStop()) {
+        if (!_lifecycle.shouldStop) {
           _logger.log('[Fast DL Worker] $e');
           await Future.delayed(const Duration(milliseconds: 200));
         }
@@ -369,10 +296,6 @@ class FastService {
       ),
     );
 
-    final client = io.HttpClient();
-    client.connectionTimeout = _connectTimeout;
-    _activeClient = client;
-
     // ── Build a non-compressible 512 KB chunk ──
     // LCG-style fill so ISP transparent compression can't cheat.
     // Allocated ONCE, shared by all workers (read-only) → zero GC pressure.
@@ -381,63 +304,52 @@ class FastService {
       chunk[i] = (i * 131 + 17) & 0xFF;
     }
 
-    int totalBytes = 0;
-    final sw = Stopwatch()..start();
-    final buf = <_Sample>[const _Sample(0, 0)];
-    bool killed = false;
+    final meter = SmoothSpeedMeter(totalDurationSeconds: _testDurationSec);
+    meter.start();
+    _lifecycle.beginPhase();
 
     // ❶ KILL TIMER
     final kill = Timer(Duration(seconds: _testDurationSec), () {
-      killed = true;
       _logger.log('[Fast UL] Kill timer → force-closing all sockets.');
-      client.close(force: true);
+      _lifecycle.timeoutPhase();
     });
+    _lifecycle.registerTimer(kill);
 
     // ❷ UI TICKER
     final ui = Timer.periodic(Duration(milliseconds: _uiTickMs), (_) {
-      if (ctrl.isClosed || killed) return;
-      final now = sw.elapsedMicroseconds;
-      buf.add(_Sample(now, totalBytes));
-      _pruneBuf(buf, now);
+      if (ctrl.isClosed || _lifecycle.shouldStop) return;
       ctrl.add(
         FastResult(
           downloadSpeedMbps: dlMbps,
-          uploadSpeedMbps: _windowedSpeed(buf, now),
+          uploadSpeedMbps: meter.tick(),
           status: 'Uploading…',
         ),
       );
     });
+    _lifecycle.registerTimer(ui);
 
     // ❸ WORKERS
     final uploadUrls = urls.map(_toUploadUrl).toList();
     _logger.log('[Fast UL] Upload URLs: ${uploadUrls.take(2)}...');
 
+    final client = io.HttpClient();
+    client.connectionTimeout = _connectTimeout;
+    _lifecycle.registerClient(client);
+
     final n = min(streams, uploadUrls.length);
-    final futures = <Future<void>>[];
     for (int i = 0; i < n; i++) {
-      futures.add(
-        _ulWorker(client, uploadUrls[i], chunk, (bytes) {
-          totalBytes += bytes;
-        }, () => killed || _isCancelled),
+      _lifecycle.launchWorker(
+        () => _ulWorker(client, uploadUrls[i], chunk, (bytes) {
+          meter.addBytes(bytes);
+        }),
       );
     }
 
-    await Future.wait(futures);
+    await _lifecycle.awaitPhaseComplete();
+    await _lifecycle.awaitAllWorkers();
 
-    sw.stop();
-    kill.cancel();
-    ui.cancel();
-    try {
-      client.close(force: true);
-    } catch (_) {}
-    if (_activeClient == client) _activeClient = null;
-
-    final mbps = _mbps(totalBytes, sw.elapsedMicroseconds);
-    _logger.log(
-      '[Fast UL] ${_fmtBytes(totalBytes)} in '
-      '${(sw.elapsedMicroseconds / 1e6).toStringAsFixed(1)}s '
-      '→ ${mbps.toStringAsFixed(2)} Mbps',
-    );
+    final mbps = meter.finish();
+    _logger.log('[Fast UL] finished at ${mbps.toStringAsFixed(2)} Mbps');
     return mbps;
   }
 
@@ -459,18 +371,17 @@ class FastService {
     String url,
     Uint8List chunk,
     void Function(int) onBytes,
-    bool Function() shouldStop,
   ) async {
     final uri = Uri.parse(url);
 
-    while (!shouldStop()) {
+    while (!_lifecycle.shouldStop) {
       try {
         final request = await client.postUrl(uri);
         request.headers.contentType = io.ContentType.binary;
         request.headers.chunkedTransferEncoding = true;
 
         // Inner loop: write chunks with backpressure
-        while (!shouldStop()) {
+        while (!_lifecycle.shouldStop) {
           request.add(chunk);
           await request.flush(); // ← BLOCKS at network speed
           onBytes(chunk.length); // ← counted AFTER confirmation
@@ -478,23 +389,16 @@ class FastService {
 
         // Graceful close (best-effort)
         try {
-          await request.close();
+          final res = await request.close();
+          await res.drain();
         } catch (_) {}
       } catch (e) {
         // SocketException is EXPECTED when kill timer fires.
-        if (!shouldStop()) {
+        if (!_lifecycle.shouldStop) {
           _logger.log('[Fast UL Worker] $e');
           await Future.delayed(const Duration(milliseconds: 200));
         }
       }
     }
-  }
-
-  // ── Formatting helper for logs ──
-  static String _fmtBytes(int b) {
-    if (b >= 1e9) return '${(b / 1e9).toStringAsFixed(2)} GB';
-    if (b >= 1e6) return '${(b / 1e6).toStringAsFixed(1)} MB';
-    if (b >= 1e3) return '${(b / 1e3).toStringAsFixed(0)} KB';
-    return '$b B';
   }
 }

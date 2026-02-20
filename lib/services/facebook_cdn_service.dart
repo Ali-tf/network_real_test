@@ -18,9 +18,9 @@ import 'dart:io' as io;
 import 'dart:math' as math;
 import 'dart:typed_data';
 
-import 'package:http/http.dart' as http;
-import 'package:http/io_client.dart';
 import 'package:network_speed_test/utils/debug_logger.dart';
+import 'package:network_speed_test/utils/smooth_speed_meter.dart';
+import 'package:network_speed_test/utils/test_lifecycle.dart';
 
 // ═══════════════════════════════════════════════════════════════════
 //  CONFIGURATION
@@ -30,7 +30,6 @@ class _Config {
   static const int downloadDurationSeconds = 15;
   static const int uploadDurationSeconds = 15;
   static const int uiUpdateIntervalMs = 200;
-  static const int slidingWindowMs = 500;
 
   static const int downloadWorkerCount = 4;
   static const int uploadWorkerCount = 3;
@@ -44,8 +43,6 @@ class _Config {
 
   static const String uploadHost = 'graph.facebook.com';
   static const String uploadPath = '/v19.0/me';
-
-  static const int maxConsecutiveErrors = 5;
 
   // v12: Native App User-Agent to trigger correct traffic shaping
   static const String userAgent =
@@ -112,55 +109,11 @@ class FacebookCdnResult {
   });
 }
 
-class _SpeedWindow {
-  final int windowMs;
-  final List<int> _times = [];
-  final List<int> _bytes = [];
+// Deprecated counter classes removed
 
-  _SpeedWindow({required this.windowMs});
-
-  void addSample(int cumulativeBytes) {
-    final now = DateTime.now().microsecondsSinceEpoch;
-    _times.add(now);
-    _bytes.add(cumulativeBytes);
-    _prune(now);
-  }
-
-  double get mbps {
-    if (_times.length < 2) return 0.0;
-    final last = _times.length - 1;
-    final cutoff = _times[last] - (windowMs * 1000);
-    int first = 0;
-    for (int i = 0; i < last; i++) {
-      if (_times[i] >= cutoff) {
-        first = i;
-        break;
-      }
-    }
-    final dBytes = _bytes[last] - _bytes[first];
-    final dTime = _times[last] - _times[first];
-    if (dTime <= 0) return 0.0;
-    return (dBytes * 8.0) / dTime;
-  }
-
-  void _prune(int nowUs) {
-    final limit = nowUs - (windowMs * 3000);
-    while (_times.length > 3 && _times.first < limit) {
-      _times.removeAt(0);
-      _bytes.removeAt(0);
-    }
-  }
-}
-
-class _SharedCounter {
-  int _bytes = 0;
-  int? firstAddTimestamp;
-  int get bytes => _bytes;
-  void add(int n) {
-    firstAddTimestamp ??= DateTime.now().microsecondsSinceEpoch;
-    _bytes += n;
-  }
-}
+// ═══════════════════════════════════════════════════════════════════
+//  PERSISTENT HTTP CONNECTION (Stateful Parser + Chunked Flush)
+// ═══════════════════════════════════════════════════════════════════
 
 class _ProbeResult {
   final String url;
@@ -180,20 +133,16 @@ class _ProbeResult {
   });
 }
 
-// ═══════════════════════════════════════════════════════════════════
-//  PERSISTENT HTTP CONNECTION (Stateful Parser + Chunked Flush)
-// ═══════════════════════════════════════════════════════════════════
-
-class _ParsedResponse {
+class FBParsedResponse {
   final int statusCode;
   final int bodyBytes;
-  _ParsedResponse(this.statusCode, this.bodyBytes);
+  FBParsedResponse(this.statusCode, this.bodyBytes);
 }
 
 class PersistentHttpConnection {
   final io.Socket _socket;
   final void Function() _onClose;
-  final _SharedCounter? _readCounter;
+  final SmoothSpeedMeter? _meter;
 
   // State Machine
   bool _readingHeaders = true;
@@ -203,20 +152,21 @@ class PersistentHttpConnection {
 
   // Buffers
   final BytesBuilder _buffer = BytesBuilder(copy: false);
-  Completer<_ParsedResponse>? _responseCompleter;
+  Completer<FBParsedResponse>? _responseCompleter;
 
   // Metrics
-  int _totalBytesParsed = 0;
+  // (Removed _totalBytesParsed since it was unused)
 
   PersistentHttpConnection(
     this._socket,
     this._onClose, {
-    _SharedCounter? counter,
-  }) : _readCounter = counter {
+    SmoothSpeedMeter? meter,
+  }) : _meter = meter {
     _socket.listen(
       _onData,
       onError: (e) {
         _close();
+        return <void>[];
       },
       onDone: () {
         _close();
@@ -232,39 +182,39 @@ class PersistentHttpConnection {
 
   void _completeWith(int status, int bytes) {
     if (_responseCompleter != null && !_responseCompleter!.isCompleted) {
-      _responseCompleter!.complete(_ParsedResponse(status, bytes));
+      _responseCompleter!.complete(FBParsedResponse(status, bytes));
     }
   }
 
-  Future<_ParsedResponse> sendRequest(Uint8List data) {
+  Future<FBParsedResponse> sendRequest(Uint8List data) {
     if (_responseCompleter != null && !_responseCompleter!.isCompleted) {
       throw StateError('Cannot send request while waiting for response');
     }
 
-    _responseCompleter = Completer<_ParsedResponse>();
+    _responseCompleter = Completer<FBParsedResponse>();
     _bytesReadForCurrentResponse = 0;
 
     try {
       _socket.add(data);
     } catch (_) {
       _close();
-      return Future.value(_ParsedResponse(0, 0));
+      return Future.value(FBParsedResponse(0, 0));
     }
 
     return _responseCompleter!.future;
   }
 
-  Future<_ParsedResponse> sendRequestChunked({
+  Future<FBParsedResponse> sendRequestChunked({
     required Uint8List header,
     required Uint8List body,
     required int chunkSize,
-    required _SharedCounter counter,
+    required SmoothSpeedMeter meter,
   }) async {
     if (_responseCompleter != null && !_responseCompleter!.isCompleted) {
       throw StateError('Cannot send request while waiting for response');
     }
 
-    _responseCompleter = Completer<_ParsedResponse>();
+    _responseCompleter = Completer<FBParsedResponse>();
     _bytesReadForCurrentResponse = 0;
 
     try {
@@ -278,22 +228,21 @@ class PersistentHttpConnection {
         _socket.add(slice);
         await _socket.flush();
 
-        counter.add(slice.length);
+        meter.addBytes(slice.length);
         offset += slice.length;
       }
     } catch (_) {
       _close();
-      return Future.value(_ParsedResponse(0, 0));
+      return Future.value(FBParsedResponse(0, 0));
     }
 
     return _responseCompleter!.future;
   }
 
   void _onData(Uint8List chunk) {
-    _readCounter?.add(chunk.length);
+    _meter?.addBytes(chunk.length);
 
     _buffer.add(chunk);
-    _totalBytesParsed += chunk.length;
     _processBuffer();
   }
 
@@ -404,8 +353,7 @@ class PersistentHttpConnection {
 // ═══════════════════════════════════════════════════════════════════
 
 class FacebookCdnService {
-  bool _isCancelled = false;
-  final List<io.SecureSocket> _activeSockets = [];
+  final TestLifecycle _lifecycle = TestLifecycle();
   final DebugLogger _logger = DebugLogger();
 
   late final Uint8List _uploadPayload = _generatePayload();
@@ -429,29 +377,19 @@ class FacebookCdnService {
         'Content-Length: ${_Config.uploadPayloadBytes}\r\n'
         'Connection: keep-alive\r\n'
         '\r\n';
-    return latin1.encode(header) as Uint8List;
+    return latin1.encode(header);
   }
 
   Stream<FacebookCdnResult> measureSpeed() {
-    _isCancelled = false;
+    _lifecycle.reset();
     final controller = StreamController<FacebookCdnResult>();
     _runTest(controller);
     return controller.stream;
   }
 
   void cancel() {
-    _isCancelled = true;
+    _lifecycle.cancel();
     _logger.log('[FNA] ✕ Cancel requested');
-    _cleanup();
-  }
-
-  void _cleanup() {
-    for (final s in _activeSockets) {
-      try {
-        s.destroy();
-      } catch (_) {}
-    }
-    _activeSockets.clear();
   }
 
   void _emit(StreamController<FacebookCdnResult> c, FacebookCdnResult r) {
@@ -463,7 +401,7 @@ class FacebookCdnService {
   }
 
   bool _isExpired(DateTime deadline) {
-    return _isCancelled || DateTime.now().isAfter(deadline);
+    return _lifecycle.shouldStop || DateTime.now().isAfter(deadline);
   }
 
   String _truncateUrl(String url) {
@@ -487,7 +425,7 @@ class FacebookCdnService {
       );
 
       final candidates = await _discoverCdnUrls();
-      if (_isCancelled) return _close(ctrl);
+      if (_lifecycle.isUserCancelled) return _close(ctrl);
 
       // ── PHASE 1: Probe ──
       _emit(
@@ -517,7 +455,7 @@ class FacebookCdnService {
         return _close(ctrl);
       }
 
-      if (_isCancelled) return _close(ctrl);
+      if (_lifecycle.isUserCancelled) return _close(ctrl);
 
       _logger.log(
         '[FNA] ✓ Best: ${probe.label} '
@@ -539,7 +477,7 @@ class FacebookCdnService {
       );
 
       await Future.delayed(const Duration(milliseconds: 300));
-      if (_isCancelled) return _close(ctrl);
+      if (_lifecycle.isUserCancelled) return _close(ctrl);
 
       // ── PHASE 2: Download ──
       _logger.log(
@@ -551,7 +489,7 @@ class FacebookCdnService {
       final dlMbps = await _runDownloadPhase(ctrl, probe);
       _logger.log('[FNA] Download: ${dlMbps.toStringAsFixed(2)} Mbps');
 
-      if (_isCancelled) return _close(ctrl);
+      if (_lifecycle.isUserCancelled) return _close(ctrl);
 
       // ── PHASE 3: Upload ──
       _logger.log(
@@ -587,6 +525,7 @@ class FacebookCdnService {
       );
 
       _logger.log('[FNA] ═══ Test Complete ═══');
+      _logger.log('[FNA] ═══ Test Complete ═══');
     } catch (e, st) {
       _logger.log('[FNA] FATAL: $e\n$st');
       _emit(
@@ -599,7 +538,6 @@ class FacebookCdnService {
         ),
       );
     } finally {
-      _cleanup();
       _close(ctrl);
     }
   }
@@ -609,7 +547,7 @@ class FacebookCdnService {
 
     // Step 1: Discover FNA Hostname via Graph API (small profile pics)
     for (final seed in _Config.graphApiSeeds) {
-      if (_isCancelled) break;
+      if (_lifecycle.isUserCancelled) break;
       try {
         final urlStr = await _discoverFromGraphApi(seed);
         if (urlStr != null) {
@@ -625,7 +563,7 @@ class FacebookCdnService {
 
     // Step 2: Discover Large Hot Media via og:image scraping
     for (final pageUrl in _Config.ogImagePages) {
-      if (_isCancelled) break;
+      if (_lifecycle.isUserCancelled) break;
       try {
         String? ogUrl = await _scrapeOgImage(pageUrl);
         if (ogUrl != null) {
@@ -667,37 +605,38 @@ class FacebookCdnService {
     final uri = Uri.parse(
       'https://graph.facebook.com/v19.0/$id/picture?type=large&redirect=false',
     );
-    final client = http.Client();
+    final client = io.HttpClient();
+    _lifecycle.registerClient(client);
+
     try {
-      final response = await client.get(uri);
+      final request = await client.getUrl(uri);
+      final response = await request.close();
       if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
+        final responseBody = await response.transform(utf8.decoder).join();
+        final data = jsonDecode(responseBody);
         final url = data['data']?['url'];
         if (url != null && url is String && url.contains('fbcdn.net')) {
           return url;
         }
       }
-    } catch (_) {
-    } finally {
-      client.close();
-    }
+    } catch (_) {}
     return null;
   }
 
   /// Scrapes public FB pages for `og:image` meta tags using bot UA
   Future<String?> _scrapeOgImage(String pageUrl) async {
-    final client = http.Client();
-    try {
-      final request = http.Request('GET', Uri.parse(pageUrl));
-      // v12 FIX: Bot UA is required to get og tags from FB
-      request.headers['User-Agent'] = _Config.botUserAgent;
+    final client = io.HttpClient();
+    _lifecycle.registerClient(client);
 
-      final response = await client
-          .send(request)
-          .timeout(_Config.discoveryTimeout);
+    try {
+      final request = await client.getUrl(Uri.parse(pageUrl));
+      // v12 FIX: Bot UA is required to get og tags from FB
+      request.headers.set('User-Agent', _Config.botUserAgent);
+
+      final response = await request.close().timeout(_Config.discoveryTimeout);
       if (response.statusCode != 200) {
         try {
-          await response.stream.drain<void>();
+          await response.drain<void>();
         } catch (_) {}
         return null;
       }
@@ -706,7 +645,7 @@ class FacebookCdnService {
       final chunks = <List<int>>[];
       int totalRead = 0;
       final done = Completer<void>();
-      final sub = response.stream.listen(
+      final sub = response.listen(
         (chunk) {
           chunks.add(chunk);
           totalRead += chunk.length;
@@ -738,47 +677,42 @@ class FacebookCdnService {
       if (match != null) {
         return match.group(1)?.replaceAll('&amp;', '&');
       }
-    } catch (_) {
-    } finally {
-      client.close();
-    }
+    } catch (_) {}
     return null;
   }
 
   Future<_ProbeResult?> _probeTargets(List<_CdnTarget> candidates) async {
     final validProbes = <_ProbeResult>[];
     for (final target in candidates) {
-      if (_isCancelled) break;
+      if (_lifecycle.isUserCancelled) break;
 
       final innerHttp = io.HttpClient()
         ..connectionTimeout = const Duration(seconds: 5);
       // Native User Agent required for CDN to trust us
       innerHttp.userAgent = _Config.userAgent;
+      _lifecycle.registerClient(innerHttp);
 
-      final client = IOClient(innerHttp);
       try {
-        final request = http.Request('GET', Uri.parse(target.url));
-        request.headers['Accept'] = 'image/webp,image/*,*/*';
+        final request = await innerHttp.getUrl(Uri.parse(target.url));
+        request.headers.set('Accept', 'image/webp,image/*,*/*');
+        final response = await request.close().timeout(_Config.probeTimeout);
 
-        final response = await client
-            .send(request)
-            .timeout(_Config.probeTimeout);
         if (response.statusCode != 200) {
           _logger.log(
             '[FNA] Probe failed for ${target.label}, HTTP ${response.statusCode}',
           );
           try {
-            await response.stream.drain();
+            await response.drain();
           } catch (_) {}
           continue;
         }
 
         int bytesRead = 0;
-        await response.stream.forEach((chunk) => bytesRead += chunk.length);
+        await response.forEach((chunk) => bytesRead += chunk.length);
 
         final cdnEdge =
-            response.headers['x-served-by'] ??
-            response.headers['x-fb-edge-debug'];
+            response.headers.value('x-served-by') ??
+            response.headers.value('x-fb-edge-debug');
 
         // v12 FIX: Check size to ensure we didn't get a 1.4KB error page
         if (bytesRead > 10000) {
@@ -786,18 +720,18 @@ class FacebookCdnService {
           validProbes.add(
             _ProbeResult(
               url: target.url,
-              host: request.url.host,
+              host: request.uri.host,
               // v12 FIX: Include query string so `oh` and `oe` auth tokens are preserved!
-              path: request.url.hasQuery
-                  ? '${request.url.path}?${request.url.query}'
-                  : request.url.path,
+              path: request.uri.hasQuery
+                  ? '${request.uri.path}?${request.uri.query}'
+                  : request.uri.path,
               label: target.label,
               cdnEdge: cdnEdge,
               contentLength: bytesRead,
             ),
           );
           _logger.log(
-            '[FNA] ✓ ${bytesRead}B, edge=$cdnEdge host=${request.url.host}',
+            '[FNA] ✓ ${bytesRead}B, edge=$cdnEdge host=${request.uri.host}',
           );
           // If we found a large one, we can stop early
           if (bytesRead > target.minBytes) break;
@@ -806,8 +740,6 @@ class FacebookCdnService {
         }
       } catch (e) {
         _logger.log('[FNA] ✕ $e');
-      } finally {
-        client.close();
       }
     }
     if (validProbes.isEmpty) return null;
@@ -831,7 +763,7 @@ class FacebookCdnService {
         timeout: _Config.socketConnectTimeout,
         supportedProtocols: ['http/1.1'],
       );
-      _activeSockets.add(socket);
+      _lifecycle.registerSocket(socket);
       return socket;
     } catch (e) {
       _logger.log('[FNA] Connect failed: $e');
@@ -849,7 +781,7 @@ class FacebookCdnService {
         'Accept-Encoding: identity\r\n'
         'Connection: keep-alive\r\n'
         '\r\n';
-    return latin1.encode(req) as Uint8List;
+    return latin1.encode(req);
   }
 
   // ── PHASE 2: DOWNLOAD (Persistent) ──
@@ -858,30 +790,28 @@ class FacebookCdnService {
     StreamController<FacebookCdnResult> ctrl,
     _ProbeResult probe,
   ) async {
-    final counter = _SharedCounter();
-    final window = _SpeedWindow(windowMs: _Config.slidingWindowMs);
+    final meter = SmoothSpeedMeter(
+      totalDurationSeconds: _Config.downloadDurationSeconds,
+    );
+    meter.start();
     final startTime = DateTime.now();
     final deadline = startTime.add(
       Duration(seconds: _Config.downloadDurationSeconds),
     );
     final phaseCompleter = Completer<double>();
+    _lifecycle.beginPhase();
 
     final monitor = Timer.periodic(
       const Duration(milliseconds: _Config.uiUpdateIntervalMs),
       (t) {
         if (_isExpired(deadline) || ctrl.isClosed) {
-          t.cancel();
-          if (!phaseCompleter.isCompleted)
-            phaseCompleter.complete(
-              _computeFinal(counter.bytes, startTime, counter),
-            );
+          _lifecycle.timeoutPhase();
           return;
         }
-        window.addSample(counter.bytes);
         _emit(
           ctrl,
           FacebookCdnResult(
-            downloadMbps: math.max(0.0, window.mbps),
+            downloadMbps: math.max(0.0, meter.tick()),
             uploadMbps: 0.0,
             status:
                 'Downloading from ${probe.host}... (${_Config.downloadWorkerCount} workers)',
@@ -891,20 +821,20 @@ class FacebookCdnService {
         );
       },
     );
+    _lifecycle.registerTimer(monitor);
 
     final getRequest = _buildGetRequest(probe.host, probe.path);
     final workerReqCounts = List<int>.filled(_Config.downloadWorkerCount, 0);
-    final futures = <Future<void>>[];
 
     for (int w = 0; w < _Config.downloadWorkerCount; w++) {
-      futures.add(
-        Future.delayed(
+      _lifecycle.launchWorker(
+        () => Future.delayed(
           Duration(milliseconds: w * 50),
           () => _dlSocketWorker(
             w,
             probe.host,
             getRequest,
-            counter,
+            meter,
             deadline,
             workerReqCounts,
           ),
@@ -912,16 +842,15 @@ class FacebookCdnService {
       );
     }
 
-    await Future.wait(futures, eagerError: false).catchError((_) {});
+    await _lifecycle.awaitPhaseComplete();
+    await _lifecycle.awaitAllWorkers();
 
-    if (!phaseCompleter.isCompleted)
-      phaseCompleter.complete(_computeFinal(counter.bytes, startTime, counter));
+    if (!phaseCompleter.isCompleted) phaseCompleter.complete(meter.finish());
     final result = await phaseCompleter.future;
-    monitor.cancel();
 
     final totalReqs = workerReqCounts.reduce((a, b) => a + b);
     _logger.log(
-      '[FNA] DL: $totalReqs reqs, ${(counter.bytes / 1024 / 1024).toStringAsFixed(2)} MB',
+      '[FNA] DL: $totalReqs reqs, finished at ${result.toStringAsFixed(2)} Mbps',
     );
     return result;
   }
@@ -930,7 +859,7 @@ class FacebookCdnService {
     int id,
     String host,
     Uint8List requestBytes,
-    _SharedCounter counter,
+    SmoothSpeedMeter meter,
     DateTime deadline,
     List<int> reqCounts,
   ) async {
@@ -942,7 +871,7 @@ class FacebookCdnService {
         socket = await _openSocket(host);
         if (socket == null) return;
 
-        connection = PersistentHttpConnection(socket, () {}, counter: counter);
+        connection = PersistentHttpConnection(socket, () {}, meter: meter);
         _logger.log('[FNA] DL W$id: Connected');
 
         while (!_isExpired(deadline)) {
@@ -959,13 +888,6 @@ class FacebookCdnService {
       } catch (e) {
         _logger.log('[FNA] DL W$id error: $e');
         await Future.delayed(const Duration(milliseconds: 500));
-      } finally {
-        if (socket != null) {
-          _activeSockets.remove(socket);
-          try {
-            socket.destroy();
-          } catch (_) {}
-        }
       }
     }
   }
@@ -977,36 +899,30 @@ class FacebookCdnService {
     double dlMbps,
     _ProbeResult probe,
   ) async {
-    final counter = _SharedCounter();
+    final meter = SmoothSpeedMeter(
+      totalDurationSeconds: _Config.uploadDurationSeconds,
+    );
+    meter.start();
     final startTime = DateTime.now();
     final deadline = startTime.add(
       Duration(seconds: _Config.uploadDurationSeconds),
     );
     final phaseCompleter = Completer<double>();
+    _lifecycle.beginPhase();
 
     final monitor = Timer.periodic(
       const Duration(milliseconds: _Config.uiUpdateIntervalMs),
       (t) {
         if (_isExpired(deadline) || ctrl.isClosed) {
-          t.cancel();
-          if (!phaseCompleter.isCompleted)
-            phaseCompleter.complete(
-              _computeFinal(counter.bytes, startTime, counter),
-            );
+          _lifecycle.timeoutPhase();
           return;
         }
-        final startUs =
-            counter.firstAddTimestamp ?? startTime.microsecondsSinceEpoch;
-        final elapsedUs = DateTime.now().microsecondsSinceEpoch - startUs;
-        final liveMbps = (elapsedUs > 0 && counter.bytes > 0)
-            ? (counter.bytes * 8.0) / elapsedUs
-            : 0.0;
 
         _emit(
           ctrl,
           FacebookCdnResult(
             downloadMbps: dlMbps,
-            uploadMbps: liveMbps,
+            uploadMbps: meter.tick(),
             status: 'Uploading... (${_Config.uploadWorkerCount} workers)',
             cdnEdge: probe.cdnEdge,
             assetUsed: probe.label,
@@ -1014,36 +930,35 @@ class FacebookCdnService {
         );
       },
     );
+    _lifecycle.registerTimer(monitor);
 
     final workerReqCounts = List<int>.filled(_Config.uploadWorkerCount, 0);
-    final futures = <Future<void>>[];
 
     for (int w = 0; w < _Config.uploadWorkerCount; w++) {
-      futures.add(
-        Future.delayed(
+      _lifecycle.launchWorker(
+        () => Future.delayed(
           Duration(milliseconds: w * 50),
-          () => _ulSocketWorker(w, counter, deadline, workerReqCounts),
+          () => _ulSocketWorker(w, meter, deadline, workerReqCounts),
         ),
       );
     }
 
-    await Future.wait(futures, eagerError: false).catchError((_) {});
+    await _lifecycle.awaitPhaseComplete();
+    await _lifecycle.awaitAllWorkers();
 
-    if (!phaseCompleter.isCompleted)
-      phaseCompleter.complete(_computeFinal(counter.bytes, startTime, counter));
+    if (!phaseCompleter.isCompleted) phaseCompleter.complete(meter.finish());
     final result = await phaseCompleter.future;
-    monitor.cancel();
 
     final totalReqs = workerReqCounts.reduce((a, b) => a + b);
     _logger.log(
-      '[FNA] UL: $totalReqs reqs, ${(counter.bytes / 1024 / 1024).toStringAsFixed(2)} MB',
+      '[FNA] UL: $totalReqs reqs, finished at ${result.toStringAsFixed(2)} Mbps',
     );
     return result;
   }
 
   Future<void> _ulSocketWorker(
     int id,
-    _SharedCounter counter,
+    SmoothSpeedMeter meter,
     DateTime deadline,
     List<int> reqCounts,
   ) async {
@@ -1064,33 +979,14 @@ class FacebookCdnService {
             header: _uploadRequestHeaders,
             body: _uploadPayload,
             chunkSize: _Config.uploadChunkSize,
-            counter: counter,
+            meter: meter,
           );
 
           if (resp.statusCode == 0) break;
         }
       } catch (e) {
         await Future.delayed(const Duration(milliseconds: 500));
-      } finally {
-        if (socket != null) {
-          _activeSockets.remove(socket);
-          try {
-            socket.destroy();
-          } catch (_) {}
-        }
       }
     }
-  }
-
-  double _computeFinal(
-    int totalBytes,
-    DateTime phaseStartTime,
-    _SharedCounter counter,
-  ) {
-    final startUs =
-        counter.firstAddTimestamp ?? phaseStartTime.microsecondsSinceEpoch;
-    final elapsedUs = DateTime.now().microsecondsSinceEpoch - startUs;
-    if (elapsedUs <= 0 || totalBytes <= 0) return 0.0;
-    return (totalBytes * 8.0) / elapsedUs;
   }
 }

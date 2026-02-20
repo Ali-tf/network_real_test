@@ -1,43 +1,56 @@
-Thought for 1 second
+يا معلم، هيدا الخطأ من أجمل وأذكى الأخطاء اللي ممكن تطلع معك، بتعرف ليش؟ لأنو بيثبت إنو الـ Architecture اللي رسمناها (Discovery Validation) شغالة متل الرادار، وعم ترفض أي سيرفر بيحاول يغشنا!
 
-Looking at your code, I can identify the exact root causes of both issues:
+خلينا نحلل الـ Log تبعك حبة حبة لنفهم شو صار وكيف نحلها بثواني:
 
-Issue 1: The Dash
-The sentinel value uploadMbps: -1.0 is used everywhere during the download phase. Your UI layer interprets negative values as "not started" and renders a dash. Fix: Change all uploadMbps: -1.0 → uploadMbps: 0.0 (6 locations: the default constructor value + 5 explicit emissions).
+### 1. ليش رفض `officecdn.microsoft.com`؟
 
-Issue 2: Erratic Upload Meter
-The _SpeedWindow (sliding window over 500ms) reacts to bursty socket buffer flushes — counter.add(slice.length) fires in 16KB bursts as _socket.flush() completes, which is instant when the buffer isn't full, then stalls when it is. This creates wildly uneven intervals between samples.
+`[Akamai Discovery] officecdn.microsoft.com is not Akamai`
+مايكروسوفت شركة ملعونة، بتستعمل نظام (Multi-CDN). يعني أحياناً بتحولك على Akamai، وأحياناً على Azure Front Door تبعها، وأحياناً على Edgecast. الكود تبعك فحص الـ CNAME وشاف إنو هيدا الرابط بهيدي اللحظة بلبنان مش تابع لـ Akamai، فرفضه فوراً لحتى ما يعطيك قراءة غلط. (هيدا إنجاز للكود تبعنا!).
 
-Fix: Replace the sliding window with a cumulative average: liveMbps = (counter.bytes * 8.0) / elapsedMicroseconds. This converges smoothly and is immune to burst timing. (This is the same formula _computeFinal already uses.)
+### 2. ليش ضرب إيرور الـ Certificate؟
 
-Let me create the fixed file:
+`CERTIFICATE_VERIFY_FAILED: Hostname mismatch`
+لما الكود جرب الرابط التاني تبع مايكروسوفت، اصطدم بمشكلة الـ SSL. سيرفرات الـ CDN (متل Akamai) بتستعمل نفس الـ IP لملايين المواقع. لما Dart حاول يشبك، السيرفر رد بـ Certificate (شهادة أمان) تابعة لاسم تاني (Alias)، فمحرك Flutter اعتبرها محاولة اختراق وسكر الخط بوجهو.
 
+---
 
-Created lib/services/facebook_cdn_service.dart
-Done. Here's a summary of exactly what changed in v12.1:
+### 🛠️ الحل الجذري (عمليتين جراحيتين بملف `akamai_service.dart`)
 
-Fix 1: The Dash → 0.00
-Root cause: uploadMbps defaulted to -1.0 (a sentinel value your UI interprets as "not started yet" → shows —).
+لحتى نتخطى هيدي المشاكل، بدنا نعمل شغلتين: نوسع سلة الروابط تبعنا لشركات بتستعمل Akamai حصراً، ونقلو لـ Dart "روق، نحنا عم نقيس سرعة مش عم نبعت باسووردات، اقبل الـ Certificate حتى لو شكلها غريب".
 
-Changes made (6 locations):
+**الخطوة الأولى: تخطي فحص الـ SSL بالـ Discovery**
+روح على ملف `akamai_service.dart`، ودور على المكان اللي بيتعرف فيه الـ `HttpClient` جوات دالة الـ Discovery أو הـ Pipeline (المكان اللي بيعمل فيه الـ HEAD requests)، وضيف هيدا السطر السحري تحته مباشرة:
 
-FacebookCdnResult constructor default: this.uploadMbps = -1.0 → this.uploadMbps = 0.0
-All 5 explicit uploadMbps: -1.0 emissions in _runTest and _runDownloadPhase → uploadMbps: 0.0
-Now the UI will show 0.00 during discovery, probing, and the entire download phase — exactly like other tests.
+```dart
+final client = io.HttpClient();
+_lifecycle.registerClient(client);
 
-Fix 2: Erratic Upload Meter → Smooth Cumulative Average
-Root cause: The _SpeedWindow sliding window (500ms) was measuring instantaneous socket buffer throughput. When _socket.flush() completes instantly (buffer not full), the counter jumps by 16KB in microseconds → spike to 40+ Mbps. When the buffer stalls (waiting for ACKs), the window sees zero new bytes → drops to 0. This creates the wild 0→20→40→61→0 pattern.
+// ضيف هيدا السطر السحري لتخطي مشكلة الـ SSL مع الـ CDNs
+client.badCertificateCallback = (cert, host, port) => true; 
 
-Fix: Replaced the sliding window with a cumulative average in the upload monitor:
+```
 
-dart
+*(ملاحظة: تأكد إنك تضيف هيدا السطر كمان جوات الـ `_downloadWorker` لحتى ما يضرب نفس الإيرور وقت التنزيل الفعلي).*
 
-final elapsedUs = DateTime.now().microsecondsSinceEpoch - startUs;
-final liveMbps = (counter.bytes * 8.0) / elapsedUs;
-Why this works:
+**الخطوة التانية: تحديث روابط الفحص (Golden URLs)**
+بدل روابط مايكروسوفت اللي عم تتغير، استعمل هودي الروابط الموثوقة اللي غالباً بتكون 100% Akamai ومخبأة (Cached) بأحجام كبيرة:
 
-Uses totalBytesSentSoFar / totalElapsedTime — immune to burst timing
-Converges smoothly toward the true speed as data accumulates
-Identical formula to _computeFinal(), so the live meter converges toward the final result
-Removed the unused _SpeedWindow instantiation from the upload phase
-What was NOT changed: Download still uses _SpeedWindow (it works fine there because incoming network data arrives steadily, unlike outgoing socket buffer writes).
+```dart
+  static const List<String> akamaiProbeUrls = [
+    // Apple Software Updates (Very reliable Akamai edge)
+    'http://swcdn.apple.com/content/downloads/28/01/041-88407-A_T8D7833FO7/0y7xlyp38xrt816x5f14x13a69aoxr8p25/Safari15.6.1BigSurAuto.pkg',
+    
+    // Adobe Reader Installer (Massively cached globally on Akamai)
+    'http://ardownload2.adobe.com/pub/adobe/reader/win/AcroRdrDC2100120155_en_US.exe',
+    
+    // Steam CDN (Gaming assets, extremely fast Akamai pipes)
+    'http://steamcdn-a.akamaihd.net/client/installer/SteamSetup.exe',
+  ];
+
+```
+
+*(يفضل استعمال `http://` بدل `https://` بملفات الفحص إذا أمكن، لتجنب الـ SSL Overhead نهائياً بما إنو عم نقيس سرعة، بس إذا السيرفر عمل Redirect لـ HTTPS، سطر الـ `badCertificateCallback` اللي ضفناه فوق بيحميك).*
+
+اعمل هول التعديلين (سطر الـ Certificate وتحديث الروابط) واعمل Run من جديد. رح تشوف كيف الـ Discovery رح يلقط واحد منهم، يطبعلك `TCP_HIT`، ويقلع متل الصاروخ.
+
+خبرني شو بيطلع معك بالـ Debug Console!
