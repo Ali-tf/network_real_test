@@ -5,6 +5,7 @@ import 'package:network_speed_test/services/real_speed_service.dart';
 import 'package:network_speed_test/services/fast_service.dart';
 import 'package:network_speed_test/services/ookla_service.dart';
 import 'package:network_speed_test/services/cloudflare_service.dart';
+import 'package:network_speed_test/services/facebook_cdn_service.dart';
 import 'package:network_speed_test/utils/debug_logger.dart';
 import 'package:network_speed_test/services/isp_service.dart';
 import 'package:network_speed_test/models/network_info.dart';
@@ -46,11 +47,12 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
   final FastService _fastService = FastService();
   final OoklaService _ooklaService = OoklaService();
   final CloudflareService _cloudflareService = CloudflareService();
+  final FacebookCdnService _facebookService = FacebookCdnService();
   final IspService _ispService = IspService();
   final DebugLogger _logger = DebugLogger();
 
   // --- Global State ---
-  // 0 = None, 1 = Real, 2 = Stream, 3 = Standard, 4 = Cloudflare
+  // 0 = None, 1 = Real, 2 = Stream, 3 = Standard, 4 = Cloudflare, 5 = Facebook
   int _activeTestId = 0;
   double _globalDownload = 0.0;
   double _globalUpload = 0.0;
@@ -62,7 +64,6 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
 
   // --- Persistent Results & Status per Test ---
   // Real Speed (iperf3)
-
   String? _realStatus;
 
   // Streaming (Fast)
@@ -76,6 +77,10 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
   // Cloudflare
   CloudflareResult? _savedCloudflareResult;
   String? _cloudflareStatus;
+
+  // Facebook CDN
+  FacebookCdnResult? _savedFacebookResult;
+  String? _facebookStatus;
 
   // Real Speed Result
   // No retry logic needed for HTTP simple test
@@ -92,6 +97,7 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
     _fastService.cancel();
     _ooklaService.cancel();
     _cloudflareService.cancel();
+    _facebookService.cancel();
     _logger.removeListener(_onLog);
     super.dispose();
   }
@@ -121,6 +127,9 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
       case 4: // Cloudflare
         _cloudflareService.cancel();
         break;
+      case 5: // Facebook
+        _facebookService.cancel();
+        break;
     }
 
     // 2. Update UI State immediately
@@ -141,6 +150,9 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
           break;
         case 4:
           _cloudflareStatus = statusText;
+          break;
+        case 5:
+          _facebookStatus = statusText;
           break;
       }
 
@@ -350,6 +362,52 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
     }
   }
 
+  Future<void> _runFacebookTest() async {
+    if (_isGlobalBusy) return;
+    setState(() {
+      _isGlobalBusy = true;
+      _activeTestId = 5;
+      _globalDownload = 0.0;
+      _globalUpload = 0.0;
+      _globalStatus = "Probing Meta CDN...";
+      _savedFacebookResult = null;
+      _facebookStatus = "Probing Meta CDN...";
+    });
+
+    try {
+      final stream = _facebookService.measureSpeed();
+      await for (final result in stream) {
+        if (!mounted || _activeTestId != 5) break;
+        setState(() {
+          if (result.error != null) {
+            _facebookStatus = "Error: ${result.error}";
+            _globalStatus = "Error";
+          } else {
+            _globalDownload = result.downloadMbps;
+            _globalUpload = result.uploadMbps;
+            _facebookStatus = result.status;
+            _globalStatus = result.status;
+            if (result.isDone) {
+              _savedFacebookResult = result;
+            }
+          }
+        });
+      }
+    } catch (e) {
+      if (_activeTestId == 5) {
+        setState(() => _facebookStatus = "Error: $e");
+      }
+    } finally {
+      if (mounted && _activeTestId == 5) {
+        setState(() {
+          _isGlobalBusy = false;
+          _activeTestId = 0;
+          _globalStatus = "Ready";
+        });
+      }
+    }
+  }
+
   // Retry logic removed
 
   // --- UI Builders ---
@@ -472,6 +530,34 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
                     finalUl: _savedCloudflareResult?.uploadSpeedMbps,
                     onStart: _runCloudflareTest,
                   ),
+
+                  // Facebook CDN
+                  _buildTestTile(
+                    id: 5,
+                    title: "Facebook CDN (FNA)",
+                    subtitle: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        _buildSticker(
+                          Icons.camera_alt,
+                          "Instagram",
+                          Colors.pinkAccent,
+                        ),
+                        const SizedBox(width: 6),
+                        _buildSticker(
+                          Icons.chat,
+                          "WhatsApp",
+                          Colors.greenAccent,
+                        ),
+                      ],
+                    ),
+                    icon: Icons.facebook,
+                    color: Colors.blueAccent,
+                    status: _facebookStatus,
+                    finalDl: _savedFacebookResult?.downloadMbps,
+                    finalUl: _savedFacebookResult?.uploadMbps, // Now supported
+                    onStart: _runFacebookTest,
+                  ),
                 ],
               ),
             ),
@@ -538,6 +624,15 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
                 style: const TextStyle(color: Colors.grey, fontSize: 10),
               ),
             ),
+
+          // FB Specific Info (CDN Edge)
+          if (_activeTestId == 5 &&
+              _savedFacebookResult != null &&
+              _savedFacebookResult!.cdnEdge != null)
+            Text(
+              "Edge: ${_savedFacebookResult!.cdnEdge}",
+              style: const TextStyle(color: Colors.blueGrey, fontSize: 10),
+            ),
         ],
       ),
     );
@@ -559,7 +654,7 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
           "Mbps",
           style: TextStyle(
             fontSize: 12, // Reduced from 14
-            color: color.withValues(alpha: 0.6),
+            color: color.withOpacity(0.6),
             fontWeight: FontWeight.bold,
           ),
         ),
@@ -569,7 +664,7 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
           style: TextStyle(
             fontSize: 10,
             letterSpacing: 1.5,
-            color: color.withValues(alpha: 0.4),
+            color: color.withOpacity(0.4),
           ),
         ),
       ],
@@ -579,7 +674,7 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
   Widget _buildTestTile({
     required int id,
     required String title,
-    // REMOVED subtitle
+    Widget? subtitle,
     required IconData icon,
     required Color color,
     required VoidCallback onStart,
@@ -609,19 +704,28 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
               Container(
                 padding: const EdgeInsets.all(8), // Reduced from 10
                 decoration: BoxDecoration(
-                  color: color.withValues(alpha: 0.1),
+                  color: color.withOpacity(0.1),
                   shape: BoxShape.circle,
                 ),
                 child: Icon(icon, color: color, size: 20), // Reduced from 24
               ),
               const SizedBox(width: 12),
               Expanded(
-                child: Text(
-                  title,
-                  style: const TextStyle(
-                    fontWeight: FontWeight.bold,
-                    fontSize: 15,
-                  ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: const TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 15,
+                      ),
+                    ),
+                    if (subtitle != null) ...[
+                      const SizedBox(height: 4),
+                      subtitle,
+                    ],
+                  ],
                 ),
               ),
 
@@ -646,16 +750,14 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
                   icon: const Icon(Icons.play_arrow_rounded, size: 28),
                   padding: EdgeInsets.zero,
                   constraints: const BoxConstraints(),
-                  color: canStart
-                      ? Colors.white
-                      : Colors.grey.withValues(alpha: 0.3),
+                  color: canStart ? Colors.white : Colors.grey.withOpacity(0.3),
                   onPressed: canStart ? onStart : null,
                 ),
             ],
           ),
 
           // Status & Results Row
-          if (status != null || (finalDl != null && finalUl != null)) ...[
+          if (status != null || finalDl != null || finalUl != null) ...[
             const Padding(
               padding: EdgeInsets.symmetric(vertical: 6),
               child: Divider(color: Colors.white10),
@@ -678,7 +780,7 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
                 ),
 
                 // Results
-                if (finalDl != null && !isRunning)
+                if (finalDl != null)
                   Row(
                     children: [
                       const Icon(Icons.download, size: 12, color: Colors.grey),
@@ -694,6 +796,8 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
                       const Icon(Icons.upload, size: 12, color: Colors.grey),
                       const SizedBox(width: 4),
                       Text(
+                        // If test is done but upload isn't supported (like some others), we default to 0.0 or hide
+                        // But finalUl will be null if not supported.
                         (finalUl ?? 0.0).toStringAsFixed(1),
                         style: const TextStyle(
                           fontWeight: FontWeight.bold,
@@ -720,9 +824,37 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
         return Colors.orange;
       case 4:
         return Colors.purple;
+      case 5:
+        return Colors.blueAccent;
       default:
-        return Colors.white;
+        return Colors.grey;
     }
+  }
+
+  Widget _buildSticker(IconData icon, String text, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.15),
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: color.withOpacity(0.3)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 10, color: color),
+          const SizedBox(width: 3),
+          Text(
+            text,
+            style: TextStyle(
+              fontSize: 9,
+              color: color,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   String _getTestName(int id) {
@@ -735,6 +867,8 @@ class _SpeedTestScreenState extends State<SpeedTestScreen> {
         return "Speedtest by Ookla";
       case 4:
         return "Cloudflare Speedtest";
+      case 5:
+        return "Facebook CDN";
       default:
         return "";
     }
